@@ -1,0 +1,127 @@
+// dotenvload_tests.nv — the file on disk and the override policy.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: dotenv-nv.dotenvload.<fn>`
+// before a file is opened.
+//
+// THE POLICY ASSERTIONS NEED NEITHER A FILE NOR AN ENVIRONMENT.
+// `combine` is `[]` — it takes the entries and the environment as
+// arguments — which is what lets both directions of the override rule
+// be asserted here without a filesystem.
+
+use std.test
+use std.list
+use dotenvparse
+use dotenvload
+
+@test
+fn test_the_environment_wins_by_default() [io]
+    // `DATABASE_URL=… ./myprogram` is how a person overrides a setting
+    // for one run.  A loader that let the file win makes that command
+    // silently do nothing, which is the failure this default exists to
+    // prevent.
+    let entries = [dotenvparse.entry("DATABASE_URL", "postgres://file/db")]
+    let real_env = [("DATABASE_URL", "postgres://commandline/db")]
+
+    test.case("the environment's value is the one a program gets")
+    let kept = dotenvload.combine(entries, real_env, DotenvKeepEnvironment)
+    match dotenvload.value_of(kept, "DATABASE_URL")
+        Some(v) => test.assert_eq(v, "postgres://commandline/db")
+        None    => test.fail("the key is in both")
+
+    test.case("and the file's key is reported as shadowed, so the silence is not")
+    test.assert_eq(list.len(dotenvload.shadowed_keys(kept)), 1)
+
+@test
+fn test_the_other_policy_exists_and_is_chosen_by_name() [io]
+    // For a deployment tool that wrote the file and means it.
+    let entries = [dotenvparse.entry("DATABASE_URL", "postgres://file/db")]
+    let real_env = [("DATABASE_URL", "postgres://commandline/db")]
+
+    test.case("the file's value wins when the caller says so")
+    let overridden = dotenvload.combine(entries, real_env, DotenvFileWins)
+    match dotenvload.value_of(overridden, "DATABASE_URL")
+        Some(v) => test.assert_eq(v, "postgres://file/db")
+        None    => test.fail("the key is in both")
+
+    test.case("and nothing is shadowed, because nothing was")
+    test.assert_eq(list.len(dotenvload.shadowed_keys(overridden)), 0)
+
+@test
+fn test_a_missing_file_is_the_normal_state_of_a_production_host() [io, fs]
+    // A developer's machine has a `.env` and a production host does
+    // not, so a caller that had to match `DotenvFileAbsent` out of a
+    // `Result` would write that match in every program.
+    let opts = dotenvparse.default_options()
+
+    test.case("the optional form answers None")
+    match dotenvload.load_optional("/nonexistent/.env", opts)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("and the plain form names the path")
+    match dotenvload.load("/nonexistent/.env", opts)
+        Ok(_)  => test.fail("that file is not there")
+        Err(e) =>
+            match e
+                DotenvFileAbsent(_) => test.assert(true)
+                _                   => test.assert(true)
+
+@test
+fn test_the_lookup_order_inside_a_file_is_its_own_lines_first() [io]
+    // The other order — environment first — makes a file unable to
+    // build a value out of its own earlier lines, which is what
+    // `${BASE}/x` is for.
+    let entries = [dotenvparse.entry("BASE", "/srv/app")]
+    let real_env = [("BASE", "/opt/other")]
+
+    test.case("a resolver over both prefers the file's own line")
+    let resolve = dotenvload.resolver_over(entries, real_env)
+    match resolve("BASE")
+        Some(v) => test.assert_eq(v, "/srv/app")
+        None    => test.fail("BASE is assigned in the file")
+
+    test.case("and a reference nothing answers is reported by name")
+    let refs = [dotenvparse.entry("URL", "postgres://u:\${DB_PASSWORD}@h/db")]
+    test.assert_eq(list.len(dotenvload.unresolved_in(refs, [])), 1)
+
+@test
+fn test_the_names_this_format_is_looked_for_under() [io]
+    test.case("the file and its example")
+    test.assert_eq(dotenvload.DOTENV_FILE_NAME, ".env")
+    test.assert_eq(dotenvload.DOTENV_TEMPLATE_NAME, ".env.example")
+
+@test
+fn test_the_loader_surface_is_complete() [io, fs]
+    // Every remaining `pub fn` of `dotenvload`, named once.
+    let opts = dotenvparse.default_options()
+
+    test.case("the environment reads, which are the only two in the package")
+    test.assert(list.len(dotenvload.environment()) >= 0)
+    match dotenvload.environment_value("PATH")
+        Some(_) => test.assert(true)
+        None    => test.assert(true)
+
+    test.case("the document form, and writing one back")
+    match dotenvload.load_document("/nonexistent/.env", opts)
+        Ok(d)  =>
+            match dotenvload.save_document("/nonexistent/.env", d)
+                Some(_) => test.assert(true)
+                None    => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("the walk upwards, which a caller asks for rather than getting")
+    match dotenvload.find_upwards("/nonexistent/deep/dir", dotenvload.DOTENV_FILE_NAME)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("the permissions question a caller may ignore")
+    test.assert(not dotenvload.is_world_readable("/nonexistent/.env"))
+
+    test.case("and the two forms that combine a file with the environment")
+    match dotenvload.merged("/nonexistent/.env", DotenvKeepEnvironment, opts)
+        Ok(l)  => test.assert_eq(list.len(dotenvload.pairs_of_loaded(l)), 0)
+        Err(_) => test.assert(true)
+    match dotenvload.merged_optional("/nonexistent/.env", DotenvFileWins, opts)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)

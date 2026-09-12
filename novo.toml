@@ -1,0 +1,50 @@
+[package]
+name        = "dotenv-nv"
+version     = "0.0.1"
+description = "The `.env` grammar and the file that carries it: three value forms with three different escape rules, `${VAR}` interpolation with defaults, the `export` prefix, multiline values, a document that keeps its comments so a rewrite is a one-line edit, and a loader whose override policy against the real environment is a declared argument.  One call converts a file into config-core-nv's layer.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and THREE OF THE FOUR MODULES DECLARE NOTHING.  `dotenvparse`
+# is the grammar, `dotenvwrite` is the comment-preserving writer and
+# `dotenvconf` is the conversion into config-core-nv's tree; every row
+# in all three is `[]`.  What performs is `dotenvload` — `[fs]` for the
+# file, and `[io]` in the two functions that read the process
+# environment, which is what `std.env` declares (there is no `[env]`
+# label in SPEC § 5.1; the environment is `[io]`).
+#
+# `layer = "host"` AND NOT `layer = "core"` WITH `host_modules`: the
+# package's subject is a file on disk, and the grammar is here because
+# a loader needs one.
+layer       = "host"
+
+category    = "data"
+
+tags        = ["dotenv", "env", "configuration", "environment", "parser"]
+repository  = "https://github.com/novolang/dotenv-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "A .env file, and what it actually means"
+
+[dependencies]
+# `ConfigValue`, `ConfigLayer` and `EnvKeyRule`: the tree a `.env` file
+# becomes so config-nv can stack it beside a TOML file and the process
+# environment.  `core`, so `dep-layer` holds.
+#
+# config-nv 0.0.1 already carries a `cfgdotenv` module with its own
+# `parse_dotenv`.  The plan's row for this package says config-nv is
+# "the layered front", and the README argues the division: this package
+# owns the grammar, and config-nv's module becomes the two-line
+# adapter it was always meant to be.
+config-core-nv = "^0.0.1"

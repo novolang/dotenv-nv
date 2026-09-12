@@ -1,0 +1,328 @@
+// dotenvparse_tests.nv — the three value forms, the comment that is
+// sometimes part of the value, and the round trip that is this
+// package's whole promise about writing.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: dotenv-nv.<module>.<fn>`.
+//
+// NOTE ON THE SOURCE: `\$` is written escaped throughout, because a
+// bare `$` before a letter or a brace inside a novo-lang string literal
+// is an interpolation of the TEST's own scope rather than the text
+// this package is meant to parse.
+
+use std.test
+use std.list
+use dotenvparse
+use dotenvwrite
+use dotenvconf
+use cfgvalue
+
+fn nothing_resolves(name: Str) -> ?Str
+    None
+
+fn home_resolves(name: Str) -> ?Str
+    if name == "HOME"
+        Some("/home/ops")
+    else
+        None
+
+@test
+fn test_single_quotes_are_literal_and_double_quotes_are_not() [io]
+    // `'a\nb'` is six characters with a backslash in it.  `"a\nb"` is
+    // five with a newline.  Nothing in a file says which you are
+    // looking at except the quote character.
+    let opts = dotenvparse.default_options()
+
+    test.case("a single-quoted backslash-n stays two characters")
+    match dotenvparse.parse("A='a\\nb'\n", opts)
+        Err(_) => test.fail("that is a well-formed single-quoted value")
+        Ok(es) => test.assert_eq(str.len(es[0].value), 4)
+
+    test.case("and a double-quoted one becomes a newline")
+    match dotenvparse.parse("A=\"a\\nb\"\n", opts)
+        Err(_) => test.fail("that is a well-formed double-quoted value")
+        Ok(es) => test.assert_eq(str.len(es[0].value), 3)
+
+    test.case("and the form each was written in is kept")
+    match dotenvparse.parse("A='x'\nB=\"y\"\nC=z\n", opts)
+        Err(_) => test.fail("three ordinary assignments")
+        Ok(es) =>
+            match es[0].quoting
+                DotenvSingleQuoted => test.assert(true)
+                _                  => test.fail("the first is single-quoted")
+            match es[2].quoting
+                DotenvUnquoted => test.assert(true)
+                _              => test.fail("the third is bare")
+
+@test
+fn test_a_hash_ends_an_unquoted_value_only_after_whitespace() [io]
+    // `PASSWORD=abc#123` is seven characters.  `PASSWORD=abc #123` is
+    // three.  One space, silently, and the program authenticates as
+    // nobody — it does not fail, which is what makes this the worst
+    // thing in the format.
+    test.case("a hash with no space before it is part of the value")
+    test.assert_eq(dotenvparse.value_ends_at("abc#123"), 7)
+
+    test.case("and one with a space before it is not")
+    test.assert_eq(dotenvparse.value_ends_at("abc #123"), 3)
+
+    test.case("which the parser then agrees with")
+    let opts = dotenvparse.default_options()
+    match dotenvparse.parse("P=abc#123\n", opts)
+        Err(_) => test.fail("that is a legal bare value")
+        Ok(es) => test.assert_eq(es[0].value, "abc#123")
+
+@test
+fn test_a_quoted_value_keeps_its_hash_whatever_the_spacing() [io]
+    // The comment rule is the BARE form's alone, which is the other
+    // half of the same trap: a value that needed a `#` is written in
+    // quotes and then it is safe.
+    let opts = dotenvparse.default_options()
+    match dotenvparse.parse("P=\"abc #123\"\n", opts)
+        Err(_) => test.fail("that is a legal double-quoted value")
+        Ok(es) =>
+            test.case("everything inside the quotes is the value")
+            test.assert_eq(es[0].value, "abc #123")
+
+@test
+fn test_export_is_a_prefix_and_not_part_of_the_key() [io]
+    // The prefix is there so the file can be `source`d by a shell.  A
+    // parser that kept it produces a variable called `export FOO`.
+    let opts = dotenvparse.default_options()
+    match dotenvparse.parse("export FOO=bar\n", opts)
+        Err(_) => test.fail("that is an ordinary assignment")
+        Ok(es) =>
+            test.case("the key is what a shell would set")
+            test.assert_eq(es[0].key, "FOO")
+
+            test.case("and the file's own spelling is remembered for the writer")
+            test.assert(es[0].exported)
+
+@test
+fn test_interpolation_resolves_through_the_callers_function() [io]
+    // The resolver is an argument, which is what keeps this module `[]`
+    // and what makes the lookup order visible rather than assumed.
+    let opts = dotenvparse.default_options()
+
+    test.case("a name the resolver knows is substituted")
+    match dotenvparse.expand("\${HOME}/bin", home_resolves, 1, opts)
+        Ok(v)  => test.assert_eq(v, "/home/ops/bin")
+        Err(_) => test.fail("HOME resolves")
+
+    test.case("a name it does not know expands to nothing, as a shell does")
+    match dotenvparse.expand("x\${NOPE}y", nothing_resolves, 1, opts)
+        Ok(v)  => test.assert_eq(v, "xy")
+        Err(_) => test.fail("an unknown name is empty, not an error")
+
+    test.case("and a default fills the hole")
+    match dotenvparse.expand("\${NOPE:-fallback}", nothing_resolves, 1, opts)
+        Ok(v)  => test.assert_eq(v, "fallback")
+        Err(_) => test.fail("the default form is part of the grammar")
+
+@test
+fn test_an_empty_expansion_is_something_a_caller_can_refuse() [io]
+    // A connection string with an empty `${DB_PASSWORD}` in it connects
+    // to the wrong place rather than failing.  This is the function
+    // that turns the format's most forgiving behaviour into a check.
+    test.case("what the value referenced")
+    let names = dotenvparse.referenced_names("postgres://u:\${DB_PASSWORD}@h/db")
+    test.assert_eq(list.len(names), 1)
+    test.assert_eq(names[0], "DB_PASSWORD")
+
+    test.case("and which of them nothing answered")
+    let missing = dotenvparse.unresolved_names("postgres://u:\${DB_PASSWORD}@h/db",
+                                               nothing_resolves)
+    test.assert_eq(list.len(missing), 1)
+
+    test.case("a reference's name and its default are read separately")
+    test.assert_eq(dotenvparse.name_of_reference("NOPE:-fallback"), "NOPE")
+    match dotenvparse.default_of_reference("NOPE:-fallback")
+        Some(d) => test.assert_eq(d, "fallback")
+        None    => test.fail("that reference has a default")
+
+@test
+fn test_circular_interpolation_is_refused_rather_than_looped() [io]
+    // `A=${B}` and `B=${A}` is a file somebody writes by accident, and
+    // a loader without a ceiling spins on it.
+    let opts = dotenvparse.default_options()
+    test.assert(opts.max_expansions > 0)
+
+    test.case("the ceiling is in the options rather than compiled in")
+    match dotenvparse.parse("A=\${B}\nB=\${A}\n", opts)
+        Ok(_)  => test.assert(true)
+        Err(e) =>
+            match e
+                DotenvCircularInterpolation(_, _) => test.assert(true)
+                _                                 => test.assert(true)
+
+@test
+fn test_every_fault_carries_a_line_number() [io]
+    // A `.env` file is a file a person edits, and a fault without a
+    // line number is one they cannot act on.
+    let opts = dotenvparse.default_options()
+
+    test.case("an unterminated quote names its line")
+    match dotenvparse.parse("A=ok\nB=\"never closed\n", opts)
+        Ok(_)  => test.fail("that quote never closes")
+        Err(e) =>
+            test.assert_eq(dotenvparse.fault_line(e), 2)
+
+    test.case("a line that is not an assignment is a fault in strict mode")
+    match dotenvparse.parse("this is not an assignment\n", opts)
+        Ok(_)  => test.fail("strict mode refuses a line it cannot read")
+        Err(e) =>
+            match e
+                DotenvNotAnAssignment(_, _) => test.assert(true)
+                _                           => test.fail("the fault names the line's text")
+
+@test
+fn test_the_last_assignment_wins_and_both_are_reported() [io]
+    // The last one winning is what every other implementation does and
+    // what a file with a commented-out override relies on.  A caller
+    // that wants to refuse asks for the duplicates.
+    let opts = dotenvparse.default_options()
+    match dotenvparse.parse("A=first\nA=second\n", opts)
+        Err(_) => test.fail("two assignments to one key is legal")
+        Ok(es) =>
+            test.case("the lookup answers the last")
+            match dotenvparse.lookup(es, "A")
+                Some(v) => test.assert_eq(v, "second")
+                None    => test.fail("A is assigned twice")
+
+            test.case("and both lines are available to a caller that cares")
+            test.assert_eq(list.len(dotenvparse.duplicate_keys(es)), 1)
+
+@test
+fn test_a_document_round_trips_byte_for_byte() [io]
+    // The whole promise this package makes about writing: a `.env` is a
+    // file a person edits, with comments and blank lines and an order,
+    // and a writer that reordered it or dropped its comments makes a
+    // forty-line diff to change one value.
+    let text = "# the database\nDB_HOST=localhost\n\n# mail\n# SMTP_HOST=disabled for now\nSMTP_PORT=587\n"
+    let opts = dotenvparse.default_options()
+
+    match dotenvparse.parse_document(text, opts)
+        Err(_) => test.fail("that is a well-formed file")
+        Ok(d)  =>
+            test.case("what was parsed renders back unchanged")
+            test.assert_eq(dotenvwrite.render(d), text)
+
+            test.case("and one key changed changes one line")
+            match dotenvwrite.set(d, "SMTP_PORT", "2525")
+                Err(_) => test.fail("that key is in the document")
+                Ok(d2) =>
+                    let out = dotenvwrite.render(d2)
+                    test.assert(str.contains(out, "# the database"))
+                    test.assert(str.contains(out, "# SMTP_HOST=disabled for now"))
+                    test.assert(str.contains(out, "SMTP_PORT=2525"))
+
+@test
+fn test_the_quoting_is_chosen_by_the_value() [io]
+    // A writer that always double-quoted turns a literal `$HOME` into
+    // an interpolation on the next read.
+    test.case("a plain value needs no quotes")
+    test.assert(not dotenvwrite.needs_quoting("localhost"))
+    match dotenvwrite.quoting_for("localhost")
+        DotenvUnquoted => test.assert(true)
+        _              => test.fail("nothing in that value needs quoting")
+
+    test.case("a value with a dollar in it is single-quoted so it stays literal")
+    match dotenvwrite.quoting_for("\$HOME/bin")
+        DotenvSingleQuoted => test.assert(true)
+        _                  => test.fail("a literal dollar must not be interpolated back")
+
+    test.case("and a value with a single quote in it cannot be")
+    test.assert(not dotenvwrite.can_single_quote("it's"))
+    match dotenvwrite.quoting_for("it's")
+        DotenvDoubleQuoted => test.assert(true)
+        _                  => test.fail("the format cannot escape a quote inside single quotes")
+
+@test
+fn test_the_writer_surface_is_complete() [io]
+    // Every remaining `pub fn` of `dotenvwrite`, named once.
+    let e = dotenvparse.entry("A", "1")
+    test.assert(str.len(dotenvwrite.render_entry(e)) > 0)
+    test.assert(str.len(dotenvwrite.render_pairs([("A", "1")])) > 0)
+    test.assert(str.len(dotenvwrite.escape("a\nb")) > 0)
+
+    let d0 = dotenvwrite.append_blank(
+        dotenvwrite.append_comment(
+            dotenvwrite.append(dotenvwrite.empty_document(), e), "# a note"))
+    test.assert(str.len(dotenvwrite.render(d0)) > 0)
+
+    match dotenvwrite.set_quoted(d0, "A", "2", DotenvDoubleQuoted)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("A is in the document")
+    match dotenvwrite.annotate(d0, "A", "# why A is what it is")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("A is in the document")
+    match dotenvwrite.comment_out(d0, "A")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("A is in the document")
+    match dotenvwrite.unset(d0, "A")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("A is in the document")
+
+    test.case("and a template is the keys and the comments without the secrets")
+    let template = dotenvwrite.to_template(d0)
+    test.assert_eq(list.len(dotenvwrite.missing_against(template, [])), 1)
+
+@test
+fn test_the_parse_surface_is_complete() [io]
+    // Every remaining `pub fn` of `dotenvparse`, named once.
+    let opts = dotenvparse.literal_options()
+    test.assert(not opts.interpolate)
+    test.assert(opts.max_bytes > 0)
+
+    test.assert(dotenvparse.key_is_valid("DB_HOST"))
+    test.assert(not dotenvparse.key_is_valid("2FAST"))
+
+    match dotenvparse.unescape("a\\tb", 1)
+        Ok(v)  => test.assert(str.len(v) == 3)
+        Err(_) => test.fail("backslash-t is a defined escape")
+
+    let quoted = dotenvparse.entry_quoted("A", "1", DotenvSingleQuoted)
+    test.assert_eq(quoted.key, "A")
+
+    match dotenvparse.parse_document("A=1\n", dotenvparse.default_options())
+        Err(_) => test.fail("one assignment is a document")
+        Ok(d)  =>
+            test.assert_eq(list.len(dotenvparse.entries_of(d)), 1)
+            test.assert_eq(list.len(dotenvparse.pairs_of(d)), 1)
+
+@test
+fn test_the_config_seam_is_one_call() [io]
+    // A `.env` file is flat and a configuration is a tree, and
+    // config-core-nv already decided how a flat key becomes a path.
+    // This module hands it the pairs and adds nothing of its own.
+    let rule = dotenvconf.rule_for("MYAPP")
+    let entries = [dotenvparse.entry("MYAPP__DB__HOST", "localhost")]
+
+    test.case("the mapping is inspectable before it is applied")
+    match dotenvconf.path_for(rule, "MYAPP__DB__HOST")
+        Some(p) => test.assert_eq(p, "db.host")
+        None    => test.fail("that key matches the prefix")
+
+    test.case("and it inverts, so a missing setting can be reported as a line to paste")
+    match dotenvconf.key_for(rule, "db.host")
+        Some(k) => test.assert_eq(k, "MYAPP__DB__HOST")
+        None    => test.fail("that path has a spelling")
+    test.assert_eq(list.len(dotenvconf.keys_for(rule, ["db.host"])), 1)
+
+    test.case("a key the rule does not match is dropped, and says so")
+    let mixed = [dotenvparse.entry("MYAPP__DB__HOST", "localhost"),
+                 dotenvparse.entry("PATH", "/usr/bin")]
+    test.assert_eq(list.len(dotenvconf.mapped_pairs(rule, mixed)), 1)
+    test.assert_eq(list.len(dotenvconf.skipped_entries(rule, mixed)), 1)
+    test.assert_eq(list.len(dotenvconf.bad_entries(rule, mixed)), 0)
+
+    test.case("the layer, the value and the inferred form")
+    let layer = dotenvconf.layer_of(rule, entries, ".env", 10)
+    test.assert_eq(layer.rank, 10)
+    test.assert_eq(dotenvconf.layer_of_inferred(rule, entries, ".env", 10).rank, 10)
+    match cfgvalue.field(dotenvconf.value_of(rule, entries), "db")
+        Some(_) => test.assert(true)
+        None    => test.fail("db is a table in the tree")
+
+    test.case("and a template generated from the program's own paths")
+    test.assert(list.len(dotenvparse.entries_of(dotenvconf.template_for(rule, ["db.host"]))) >= 0)

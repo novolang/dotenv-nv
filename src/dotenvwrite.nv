@@ -1,0 +1,147 @@
+// dotenvwrite.nv — putting a `.env` file back the way it was found,
+// with one line changed.
+//
+// Every body here is a `todo()`; the signatures are the design.
+// Every row is `[]`.
+//
+// A `.env` FILE IS A FILE A PERSON EDITS, AND THAT IS THE WHOLE OF THIS
+// MODULE'S DESIGN.  It has comments explaining why a value is what it
+// is, a blank line between the database section and the mail section,
+// and a commented-out override somebody left for next time.  A writer
+// that parsed it into a map and printed the map back destroys all of
+// that — and does it quietly, in a file that is usually in version
+// control, so the next person sees a diff that touched forty lines to
+// change one.
+//
+// So `set` takes a `DotenvDocument`, finds the assignment for that key,
+// and replaces THAT LINE.  Everything else in the file is the bytes it
+// arrived as.  A key that is not in the file is appended at the end,
+// which is the only place a writer can put something without guessing
+// what section it belongs to.
+//
+// THE QUOTING IS CHOSEN BY THE VALUE AND NOT BY THE WRITER'S HABIT.
+// `quoting_for` answers the narrowest form that round-trips: unquoted
+// where nothing in the value needs anything, single-quoted where the
+// value contains a `$` or a backslash that must stay literal,
+// double-quoted where it contains a newline or a single quote.  A
+// writer that always double-quoted would turn `PATH=$HOME/bin` into
+// something that interpolates on the next read.
+//
+// AND THE ROUND TRIP IS THE TEST.  `render(parse_document(text))`
+// equals `text`, for every file this package accepts.  That is one
+// assertion and it covers the whole of what this module is for; it is
+// in `tests/dotenvwrite_tests.nv` and it is the first thing to make
+// pass when the bodies land.
+
+// Render a document back to text.
+//
+// Byte-for-byte what was parsed, for a document that came from
+// `parse_document` and was not edited.
+pub fn render(d: DotenvDocument) -> Str []
+    todo("dotenv-nv.dotenvwrite.render")
+
+// Render one entry as a line, with its own quoting.
+pub fn render_entry(e: DotenvEntry) -> Str []
+    todo("dotenv-nv.dotenvwrite.render_entry")
+
+// Render a plain pair list as a whole file, for a caller building one
+// from nothing.
+//
+// No comments, because there are none to keep — this is the function
+// `render` is not.
+pub fn render_pairs(pairs: [(Str, Str)]) -> Str []
+    todo("dotenv-nv.dotenvwrite.render_pairs")
+
+// Set a key's value, replacing its line and leaving every other byte
+// of the document alone.
+//
+// A key that is not in the document is appended.  A key assigned twice
+// has its LAST assignment replaced, because the last one is the one
+// that was in effect and changing an earlier one would change nothing
+// a reader could see.
+pub fn set(d: DotenvDocument, key: Str, value: Str) -> Result<DotenvDocument, DotenvFault> []
+    todo("dotenv-nv.dotenvwrite.set")
+
+// Set a key's value in a chosen form.
+pub fn set_quoted(d: DotenvDocument, key: Str, value: Str,
+                  quoting: DotenvQuoting) -> Result<DotenvDocument, DotenvFault> []
+    todo("dotenv-nv.dotenvwrite.set_quoted")
+
+// Remove a key's assignment, leaving the comments around it.
+//
+// The line goes; the comment above it stays, because a comment
+// explaining a value is usually explaining the section rather than the
+// line, and a writer that guessed would delete somebody's note.
+pub fn unset(d: DotenvDocument, key: Str) -> Result<DotenvDocument, DotenvFault> []
+    todo("dotenv-nv.dotenvwrite.unset")
+
+// Comment out a key's assignment rather than removing it.
+//
+// What a person does by hand when they want a value back later, and
+// what a tool should do when it is asked to disable something rather
+// than delete it.
+pub fn comment_out(d: DotenvDocument, key: Str) -> Result<DotenvDocument, DotenvFault> []
+    todo("dotenv-nv.dotenvwrite.comment_out")
+
+// Add a comment line above a key's assignment.
+pub fn annotate(d: DotenvDocument, key: Str, comment: Str) -> Result<DotenvDocument, DotenvFault> []
+    todo("dotenv-nv.dotenvwrite.annotate")
+
+// An empty document, for a caller writing a file from nothing.
+pub fn empty_document() -> DotenvDocument []
+    todo("dotenv-nv.dotenvwrite.empty_document")
+
+// Append an assignment to a document.
+pub fn append(d: DotenvDocument, e: DotenvEntry) -> DotenvDocument []
+    todo("dotenv-nv.dotenvwrite.append")
+
+// Append a comment line.
+pub fn append_comment(d: DotenvDocument, text: Str) -> DotenvDocument []
+    todo("dotenv-nv.dotenvwrite.append_comment")
+
+// Append a blank line.
+pub fn append_blank(d: DotenvDocument) -> DotenvDocument []
+    todo("dotenv-nv.dotenvwrite.append_blank")
+
+// The narrowest quoting that round-trips this value.
+//
+// Unquoted where nothing needs anything; single-quoted where a `$` or a
+// backslash has to stay literal; double-quoted where there is a
+// newline or a single quote.  A writer that always double-quoted turns
+// a literal `$HOME` into an interpolation on the next read.
+pub fn quoting_for(value: Str) -> DotenvQuoting []
+    todo("dotenv-nv.dotenvwrite.quoting_for")
+
+// Whether a value can be written unquoted at all.
+pub fn needs_quoting(value: Str) -> Bool []
+    todo("dotenv-nv.dotenvwrite.needs_quoting")
+
+// Escape a value for a double-quoted form.
+pub fn escape(value: Str) -> Str []
+    todo("dotenv-nv.dotenvwrite.escape")
+
+// Whether a value can be written in single quotes.
+//
+// False when it contains a single quote, because the format has no way
+// to escape one inside them — which is why `quoting_for` falls through
+// to the double-quoted form for those.
+pub fn can_single_quote(value: Str) -> Bool []
+    todo("dotenv-nv.dotenvwrite.can_single_quote")
+
+// A template file from a document, with every value blanked.
+//
+// What a `.env.example` is: the keys and the comments a person needs to
+// see, and none of the secrets.  It is here because the alternative is
+// everybody maintaining the example by hand and it drifting — which is
+// how a new checkout ends up missing a variable nobody remembers
+// adding.
+pub fn to_template(d: DotenvDocument) -> DotenvDocument []
+    todo("dotenv-nv.dotenvwrite.to_template")
+
+// The keys in a template that a real file has no value for.
+//
+// The check a program runs at start-up: the example says these are
+// needed and this machine has none of them, by name and in one list
+// rather than one failure at a time.
+pub fn missing_against(template: DotenvDocument, actual: [DotenvEntry]) -> [Str] []
+    todo("dotenv-nv.dotenvwrite.missing_against")

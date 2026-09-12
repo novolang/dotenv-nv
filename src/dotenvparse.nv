@@ -1,0 +1,286 @@
+// dotenvparse.nv — the `.env` grammar: three value forms, three
+// different escape rules, and the comment that is sometimes part of the
+// value.
+//
+// Every body here is a `todo()`; the signatures are the design.
+// Every row is `[]`.
+//
+// THIS MODULE IS `core`-SHAPED INSIDE A `host` PACKAGE.  Nothing here
+// reads a file or an environment; a whole `.env` is a string a test
+// writes out.
+//
+// THERE ARE THREE VALUE FORMS AND THEY DO NOT AGREE WITH EACH OTHER.
+// That is the entire difficulty of this format, and none of it is
+// visible when you look at a file:
+//
+//   SINGLE QUOTES ARE LITERAL.  `PASSWORD='a\nb'` is six characters
+//   with a backslash in the middle, not a newline.  Nothing is
+//   interpolated and nothing is unescaped — not even `\'`, which
+//   cannot appear at all, so a single-quoted value cannot contain a
+//   single quote.
+//
+//   DOUBLE QUOTES INTERPOLATE AND UNESCAPE.  `PASSWORD="a\nb"` is five
+//   characters with a real newline, and `"${HOME}/x"` becomes a path.
+//
+//   UNQUOTED VALUES STRIP A TRAILING COMMENT, AND THAT IS THE TRAP.
+//   `PASSWORD=abc#123` is the seven characters `abc#123`, because the
+//   `#` does not follow whitespace.  `PASSWORD=abc #123` is the three
+//   characters `abc`.  One space, silently, and the password is wrong —
+//   and the program does not fail, it authenticates as nobody.
+//   `value_ends_at` is that rule as a named function so a test can
+//   assert both halves of it.
+//
+// INTERPOLATION RESOLVES THROUGH A FUNCTION THE CALLER SUPPLIES, which
+// is what keeps this module `[]` and what makes the ORDER visible.
+// `expand` takes a `fn(Str) -> ?Str`; `dotenvload` passes one that
+// looks at the pairs already parsed in this file and then at the real
+// environment, in that order, and a caller that wants the other order
+// or no environment at all passes a different function.  A module that
+// read the environment itself would have made that decision for
+// everybody and would not be `[]`.
+//
+// A `${VAR}` WITH NO VALUE IS EMPTY AND NOT AN ERROR, because that is
+// what every shell does and what every existing `.env` file assumes.
+// `${VAR:-default}` supplies one, and `${VAR}` alone with nothing
+// behind it expands to zero characters — which is also how a typo in a
+// variable name becomes a connection string with a hole in it.
+// `unresolved_names` is the function that answers what was empty, so a
+// caller that wants to refuse can.
+//
+// AND `export FOO=bar` IS AN ASSIGNMENT.  The prefix is there so the
+// file can be `source`d by a shell, it means nothing to a parser, and
+// a parser that treated `export` as part of the key produces a
+// variable called `export FOO`.
+
+// One assignment.
+pub struct DotenvEntry
+    key: Str
+    // The value AFTER unescaping and interpolation for a double-quoted
+    // form, and exactly as written for a single-quoted one.
+    value: Str
+    // Which of the three forms it was written in.  Kept because the
+    // writer has to put it back the way it found it, and because a
+    // caller reporting on a file wants to say which.
+    quoting: DotenvQuoting
+    // Whether the line carried the `export` prefix.
+    exported: Bool
+    // 1-based, for a fault that has to say where.
+    line: Int
+
+// How a value was written.
+pub enum DotenvQuoting
+    // Bare.  A `#` after whitespace ends it; a `#` without whitespace
+    // in front does not.
+    DotenvUnquoted
+    // `'…'`.  Literal throughout: no escapes, no interpolation, and no
+    // way to write a single quote inside one.
+    DotenvSingleQuoted
+    // `"…"`.  Escapes are processed and `${…}` is interpolated.
+    DotenvDoubleQuoted
+
+// One line of a file, as it was written.
+//
+// A file is a sequence of these and not a map, because the writer has
+// to put a file back with its comments, its blank lines and its order
+// intact — see `dotenvwrite`.
+pub enum DotenvLine
+    DotenvBlankLine
+    // A whole-line comment, with the `#` and the text after it.
+    DotenvCommentLine(text: Str)
+    DotenvAssignmentLine(entry: DotenvEntry)
+
+// A whole file, in order, with everything a person wrote still in it.
+pub struct DotenvDocument
+    lines: [DotenvLine]
+
+// What a parse is allowed to do.
+pub struct DotenvOptions
+    // Whether `${VAR}` in a double-quoted value is expanded.  On.  A
+    // caller reading a file it does not control may want it off, since
+    // interpolation can pull the process environment into a value.
+    interpolate: Bool
+    // Whether the `export` prefix is accepted.  On.
+    allow_export: Bool
+    // Whether a quoted value may span lines.  On: a PEM key in a `.env`
+    // file is the case this exists for.
+    allow_multiline: Bool
+    // Whether a line that is not an assignment, a comment or blank is a
+    // fault.  On.  Off makes a parser that skips junk, which is how a
+    // typo'd line becomes a variable nobody notices is missing.
+    strict: Bool
+    // The largest file this parser will accept, in bytes.
+    max_bytes: Int
+    // The largest number of interpolation steps before a value is
+    // treated as circular.
+    max_expansions: Int
+
+// What a file can be wrong about.
+//
+// Every variant carries a line, because a `.env` file is a file a
+// person edits and a fault without a line number is one they cannot
+// act on.
+pub enum DotenvFault
+    // A line that is not blank, not a comment and not an assignment.
+    DotenvNotAnAssignment(line: Int, text: Str)
+    // A key with a character that is not allowed in an environment
+    // variable name.
+    DotenvBadKey(line: Int, key: Str)
+    // An empty key — a line beginning `=`.
+    DotenvEmptyKey(line: Int)
+    // A quoted value whose closing quote never arrives.
+    DotenvUnterminatedQuote(line: Int, quote: Str)
+    // A `${` with no `}`.
+    DotenvUnterminatedInterpolation(line: Int)
+    // An escape sequence a double-quoted value does not define.
+    DotenvBadEscape(line: Int, sequence: Str)
+    // Interpolation that did not settle: `A=${B}` and `B=${A}`.
+    DotenvCircularInterpolation(name: Str, steps: Int)
+    // A file past the ceiling, carrying both numbers.
+    DotenvTooLong(length: Int, most: Int)
+    // A multiline value in a parse that disallowed one.
+    DotenvMultilineNotAllowed(line: Int)
+    // The same key assigned twice.  NOT a fault by default — the last
+    // one wins, which is what every other implementation does — but
+    // `duplicate_keys` answers them so a caller that wants to refuse
+    // can.
+    DotenvDuplicateKey(line: Int, key: Str, first_line: Int)
+
+// The options every other implementation of this format behaves as.
+pub fn default_options() -> DotenvOptions []
+    todo("dotenv-nv.dotenvparse.default_options")
+
+// Options that expand nothing, for a file whose contents are not
+// trusted.
+//
+// Interpolation can pull the process environment into a value, so a
+// program reading somebody else's `.env` should be able to say no to
+// that without giving up the rest of the grammar.
+pub fn literal_options() -> DotenvOptions []
+    todo("dotenv-nv.dotenvparse.literal_options")
+
+// Parse a file into its pairs, in the order they appear.
+//
+// Ordered, and not a map: the order is what decides which of two
+// assignments to one key wins, and a map would have thrown that away
+// before the caller could ask.
+pub fn parse(text: Str, options: DotenvOptions) -> Result<[DotenvEntry], DotenvFault> []
+    todo("dotenv-nv.dotenvparse.parse")
+
+// Parse a file into a document, keeping every comment and blank line.
+//
+// The form the writer needs.  `parse` is this with the comments
+// dropped, and a caller that only wants values should use that one.
+pub fn parse_document(text: Str, options: DotenvOptions) -> Result<DotenvDocument, DotenvFault> []
+    todo("dotenv-nv.dotenvparse.parse_document")
+
+// The assignments in a document, in order.
+pub fn entries_of(d: DotenvDocument) -> [DotenvEntry] []
+    todo("dotenv-nv.dotenvparse.entries_of")
+
+// The pairs in a document, in order, as plain strings.
+//
+// The shape config-nv's existing `parse_dotenv` answers, so an adapter
+// over this package is one call.
+pub fn pairs_of(d: DotenvDocument) -> [(Str, Str)] []
+    todo("dotenv-nv.dotenvparse.pairs_of")
+
+// The last value assigned to a key, which is the one that wins.
+pub fn lookup(entries: [DotenvEntry], key: Str) -> ?Str []
+    todo("dotenv-nv.dotenvparse.lookup")
+
+// Every key assigned more than once, with both line numbers.
+//
+// Not a fault by default, because the last one winning is what every
+// other implementation does and what a file with a commented-out
+// override relies on.  A caller that wants to refuse asks.
+pub fn duplicate_keys(entries: [DotenvEntry]) -> [DotenvFault] []
+    todo("dotenv-nv.dotenvparse.duplicate_keys")
+
+// Whether a key is a legal environment variable name: a letter or
+// underscore, then letters, digits and underscores.
+pub fn key_is_valid(key: Str) -> Bool []
+    todo("dotenv-nv.dotenvparse.key_is_valid")
+
+// Where an UNQUOTED value ends, given the text after the `=`.
+//
+// The rule that makes `abc#123` seven characters and `abc #123` three:
+// a `#` ends the value only when whitespace precedes it.  Public and
+// named because it is the silent failure in this format and a test
+// should assert both halves of it directly.
+pub fn value_ends_at(text: Str) -> Int []
+    todo("dotenv-nv.dotenvparse.value_ends_at")
+
+// Unescape a double-quoted value's body.
+//
+// `\n`, `\r`, `\t`, `\\`, `\"`, `\$` — and nothing else, because an
+// undefined escape is `DotenvBadEscape` rather than a backslash that
+// silently survives into a password.
+pub fn unescape(body: Str, line: Int) -> Result<Str, DotenvFault> []
+    todo("dotenv-nv.dotenvparse.unescape")
+
+// Expand `${…}` references in a value, resolving each through a
+// function the caller supplies.
+//
+// The resolver is the argument that keeps this module `[]` and makes
+// the lookup order the caller's: `dotenvload` passes one that reads the
+// file's own pairs first and then the process environment, and a caller
+// that wants neither passes one that always answers `None`.
+//
+// A name with no value expands to nothing rather than failing, because
+// that is what a shell does and what existing files assume.
+// `unresolved_names` is how a caller finds out it happened.
+pub fn expand(value: Str, resolve: fn(Str) -> ?Str, line: Int,
+              options: DotenvOptions) -> Result<Str, DotenvFault> []
+    todo("dotenv-nv.dotenvparse.expand")
+
+// The `${…}` names in a value, in order, whether or not they resolve.
+pub fn referenced_names(value: Str) -> [Str] []
+    todo("dotenv-nv.dotenvparse.referenced_names")
+
+// The names in a value that a resolver had nothing for, so a caller
+// that wants a missing variable to be an error can say so.
+//
+// The function that turns this format's most forgiving behaviour into
+// something a deployment can check: a connection string with an empty
+// `${DB_PASSWORD}` in it is a string that connects to the wrong place
+// rather than one that fails.
+pub fn unresolved_names(value: Str, resolve: fn(Str) -> ?Str) -> [Str] []
+    todo("dotenv-nv.dotenvparse.unresolved_names")
+
+// The default inside `${NAME:-default}`, or `None` when the reference
+// has none.
+pub fn default_of_reference(reference: Str) -> ?Str []
+    todo("dotenv-nv.dotenvparse.default_of_reference")
+
+// The variable name inside a `${…}` reference, with any default
+// stripped.
+pub fn name_of_reference(reference: Str) -> Str []
+    todo("dotenv-nv.dotenvparse.name_of_reference")
+
+// The line a fault happened on, so a caller can report it without
+// matching every variant.
+pub fn fault_line(f: DotenvFault) -> Int []
+    todo("dotenv-nv.dotenvparse.fault_line")
+
+// An entry, for a caller building a file rather than reading one.
+pub fn entry(key: Str, value: Str) -> DotenvEntry []
+    todo("dotenv-nv.dotenvparse.entry")
+
+// The same, written in a chosen form.
+pub fn entry_quoted(key: Str, value: Str, quoting: DotenvQuoting) -> DotenvEntry []
+    todo("dotenv-nv.dotenvparse.entry_quoted")
+
+// What was wrong with a `.env` file, in one line.
+//
+// Every line carries the line number, because this is a file a person
+// edits by hand.
+//
+// ```novo ignore
+// use dotenvparse
+//
+// fn report(e: DotenvFault) -> Str
+//     e.message()
+// ```
+impl Error for DotenvFault
+    fn message(self) -> Str
+        todo("dotenv-nv.dotenvparse.DotenvFault.message")

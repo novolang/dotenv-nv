@@ -1,0 +1,114 @@
+// dotenvconf.nv — the one call that turns a `.env` file into a layer
+// config-nv can stack.
+//
+// Every body here is a `todo()`; the signatures are the design.
+// Every row is `[]`.
+//
+// A `.env` FILE IS FLAT AND A CONFIGURATION IS A TREE, so something has
+// to decide how `DATABASE__POOL__SIZE` becomes `database.pool.size`.
+// config-core-nv already made that decision — `EnvKeyRule` carries a
+// prefix and the separator convention, and `cfgenvkeys.layer_from`
+// turns pairs into a `ConfigLayer` under it.  This module does not
+// invent a second one: it hands the file's pairs to that function, and
+// the only thing it adds is which pairs.
+//
+// THE VALUES STAY STRINGS UNLESS THE CALLER ASKS.  `layer_of` builds a
+// layer of string values, because a `.env` file has no types and
+// guessing them is how `VERSION=1.10` becomes the number 1.1 and
+// `ENABLED=off` stays a string while `ENABLED=false` does not.
+// config-core-nv's `infer_scalar` exists for callers that want the
+// guess, and `layer_of_inferred` is that behaviour named rather than
+// assumed.
+//
+// AND THE LAYER'S RANK IS THE CALLER'S.  Where a `.env` file sits
+// relative to a TOML file and the process environment is a decision
+// about a program, not about this format — config-nv's `ConfigStack`
+// is where that is expressed, and this module answers a layer with the
+// rank it was told.
+//
+// WHAT THIS MODULE IS *FOR*, stated plainly because the grid has two
+// packages that touch dotenv: config-nv 0.0.1 ships a `cfgdotenv`
+// module with its own `parse_dotenv`, `read_dotenv` and
+// `render_dotenv`.  The plan's row for this package says config-nv is
+// "the layered front", and the division that follows is: dotenv-nv owns
+// the GRAMMAR — three value forms, interpolation, the comment-preserving
+// document — and config-nv's module becomes an adapter over it.  This
+// module is the seam that makes that a two-line change rather than a
+// rewrite, and the README says so.
+
+// A `.env` file's pairs as a config layer, with string values.
+//
+// The rule decides how a flat key becomes a path; the rank decides
+// where the layer sits in a stack, and both are the caller's.
+pub fn layer_of(rule: EnvKeyRule, entries: [DotenvEntry], name: Str, rank: Int) -> ConfigLayer []
+    todo("dotenv-nv.dotenvconf.layer_of")
+
+// The same, with config-core-nv's scalar inference applied.
+//
+// Named rather than assumed: inference is how `VERSION=1.10` becomes
+// the number 1.1 and how `ENABLED=off` stays a string while
+// `ENABLED=false` does not.  A caller that wants it says so.
+pub fn layer_of_inferred(rule: EnvKeyRule, entries: [DotenvEntry], name: Str,
+                         rank: Int) -> ConfigLayer []
+    todo("dotenv-nv.dotenvconf.layer_of_inferred")
+
+// A `.env` file's pairs as a config value, without the layer around it.
+//
+// For a caller composing a tree by hand rather than stacking layers.
+pub fn value_of(rule: EnvKeyRule, entries: [DotenvEntry]) -> ConfigValue []
+    todo("dotenv-nv.dotenvconf.value_of")
+
+// The pairs a layer would be built from, after the rule has mapped
+// each name to a path.
+//
+// The function that makes the mapping inspectable: a key that the rule
+// does not match is dropped, and a caller debugging a missing setting
+// wants to see which.
+pub fn mapped_pairs(rule: EnvKeyRule, entries: [DotenvEntry]) -> [(Str, Str)] []
+    todo("dotenv-nv.dotenvconf.mapped_pairs")
+
+// The keys a rule dropped, with their values, so a caller can report
+// them.
+//
+// config-core-nv's `cfgenvkeys.skipped_names` answers the same question
+// for a process environment; this is that answer for a file, and it is
+// the one that explains "I put it in `.env` and nothing happened".
+pub fn skipped_entries(rule: EnvKeyRule, entries: [DotenvEntry]) -> [(Str, Str)] []
+    todo("dotenv-nv.dotenvconf.skipped_entries")
+
+// The entries whose keys are not legal config paths once mapped.
+pub fn bad_entries(rule: EnvKeyRule, entries: [DotenvEntry]) -> [ConfigFault] []
+    todo("dotenv-nv.dotenvconf.bad_entries")
+
+// A rule for a program's own prefix, which is the ordinary case.
+//
+// A thin pass-through to config-core-nv's `cfgenvkeys.rule`, here so a
+// caller that only depends on this package does not have to name the
+// other one to get started.
+pub fn rule_for(prefix: Str) -> EnvKeyRule []
+    todo("dotenv-nv.dotenvconf.rule_for")
+
+// The config path a `.env` key maps to under a rule, or `None` when the
+// rule does not match it.
+pub fn path_for(rule: EnvKeyRule, key: Str) -> ?Str []
+    todo("dotenv-nv.dotenvconf.path_for")
+
+// The `.env` key that would set a config path under a rule.
+//
+// The inverse, for a tool that prints "set `MYAPP__DB__HOST=…`" when a
+// required setting is missing — which is the message that turns a
+// configuration error into something a person can fix in one line.
+pub fn key_for(rule: EnvKeyRule, path: Str) -> ?Str []
+    todo("dotenv-nv.dotenvconf.key_for")
+
+// The `.env` keys that would set each of a list of config paths.
+pub fn keys_for(rule: EnvKeyRule, paths: [Str]) -> [Str] []
+    todo("dotenv-nv.dotenvconf.keys_for")
+
+// A template document from the config paths a program needs.
+//
+// Every path becomes a commented-out assignment with its `.env`
+// spelling, which is a `.env.example` generated from the program's own
+// schema rather than maintained by hand beside it.
+pub fn template_for(rule: EnvKeyRule, paths: [Str]) -> DotenvDocument []
+    todo("dotenv-nv.dotenvconf.template_for")
