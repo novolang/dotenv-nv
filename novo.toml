@@ -1,6 +1,6 @@
 [package]
 name        = "dotenv-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "The `.env` grammar and the file that carries it: three value forms with three different escape rules, `${VAR}` interpolation with defaults, the `export` prefix, multiline values, a document that keeps its comments so a rewrite is a one-line edit, and a loader whose override policy against the real environment is a declared argument.  One call converts a file into config-core-nv's layer.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 

@@ -1,292 +1,287 @@
 # dotenv-nv
 
-**Status: NOT IMPLEMENTED — interface only.**
+A `.env` file is a list of `NAME=value` lines that a program reads at
+startup to find its settings. The format has no specification. What it
+means is what
+[dotenvy](https://github.com/allan2/dotenvy) in Rust and
+[python-dotenv](https://github.com/theskumar/python-dotenv) do, and this
+package ports those two. It reads the format, edits a file without
+losing its comments, and hands the result to
+[config-core-nv](https://novo-lang.org/packages/config-core-nv) for a
+program that stacks several sources of configuration.
 
-Every public function below is published with its signature and its
-effect row, and every body is `todo()`.  Installing this package works;
-calling it panics with `not implemented`.
+**Status: NOT IMPLEMENTED — interface only.** Every function is
+declared with its full signature, but every body is a `todo()` that
+panics when called. The package is published so its design can be
+reviewed and depended on before it is implemented. Version 0.1.0 will
+be the first working release.
 
-## What this is
+## What it is
 
-The `.env` format: the grammar, a document that keeps its comments so a
-rewrite is a one-line edit, a loader whose override policy against the
-process environment is an argument rather than a habit, and one call
-that turns a file into a config-core-nv layer.
+A file is a sequence of lines. A line is blank, a comment beginning
+with `#`, or an **assignment**: a name, an `=`, and a value. A value is
+written in one of three forms, and the three do not mean the same
+thing.
 
-It is the format's package.  config-nv is the layered configuration
-front that stacks a `.env` beside a TOML file and the process
-environment; this is the thing under it that knows what
-`PASSWORD=abc #123` actually means.
+| Written | What it means |
+| --- | --- |
+| `A=a\nb` | Bare. A `#` after whitespace ends the value; a `#` with no whitespace in front of it does not. |
+| `A='a\nb'` | Single-quoted. Literal throughout: no escape sequences, no interpolation, and no way to write a single quote inside. |
+| `A="a\nb"` | Double-quoted. Escape sequences are processed and `${…}` is interpolated. |
 
-## Adding it, and checking it
+`A='a\nb'` is therefore six characters including a backslash, and
+`A="a\nb"` is five characters including a newline.
 
-```bash
-novo pkg add dotenv-nv       # into your novo.toml
-novo pkg build               # type- and effect-check the package
-novo test --isolate tests/dotenvparse_tests.nv
+**Interpolation** is `${NAME}` inside a double-quoted value, replaced
+by that name's value. `${NAME:-text}` supplies a default for when the
+name has none. The lookup order is the file's own earlier assignments
+first, then the process environment, which is what lets a file build
+`${BASE}/x` out of a line above it.
+
+An assignment may carry the prefix `export`, so that the same file can
+be read by a shell with `source`. It means nothing to a parser.
+
+A **document** is the file with every line kept as it was written,
+including the comments, the blank lines and the order. A program that
+changes one value rewrites one line, and the rest of the file comes
+back byte for byte.
+
+An **override policy** decides what wins when a name is in both the
+file and the process environment. `DotenvKeepEnvironment` gives it to
+the environment, which is what makes `DATABASE_URL=… ./myprogram` work.
+`DotenvFileWins` gives it to the file, for a deployment tool that wrote
+the file and means it.
+
+## Install
+
+```
+novo pkg add dotenv-nv
 ```
 
-`novo test` is red today and that is the point of the release: every
-assertion fails with `not implemented: dotenv-nv.<module>.<fn>`.
-
-## The one example that will work
+## Example
 
 ```novo
 use dotenvload
 use dotenvparse
 
-// Read a .env beside the program, with the process environment winning
-// — which is what makes `DATABASE_URL=… ./myprogram` work.
-//
-// `shadowed_keys` is the answer to "I changed .env and nothing
-// happened": the file assigned those keys and the environment already
-// had them.  The caller decides whether that is worth a line of output.
-fn settings() -> Result<DotenvLoaded, DotenvLoadFault> [fs, io]
-    let loaded = dotenvload.merged_optional(dotenvload.DOTENV_FILE_NAME,
-                                            DotenvKeepEnvironment,
-                                            dotenvparse.default_options())!
-    let ignored = dotenvload.shadowed_keys(loaded)
-    Ok(loaded)
+fn main() [fs, io]
+    // Read ./.env if it is there, and combine it with the process
+    // environment. The environment wins, so `FOO=bar ./program` still
+    // overrides one setting for one run.
+    match dotenvload.merged_optional(dotenvload.DOTENV_FILE_NAME,
+                                     DotenvKeepEnvironment,
+                                     dotenvparse.default_options())
+        Err(f)     => println(f.message())
+        Ok(loaded) =>
+            // One setting, by name.
+            match dotenvload.value_of(loaded, "DATABASE_URL")
+                None    => println("DATABASE_URL is not set")
+                Some(u) => println(u)
+
+            // The keys the file assigned that the environment already
+            // had. This is why an edit to the file did nothing.
+            for key in dotenvload.shadowed_keys(loaded)
+                println("${key} came from the environment")
 ```
 
-## The layer, and why
+Build and test with `novo pkg build` and `novo test`. Today `novo test`
+fails on purpose: every test reaches a `not implemented:
+dotenv-nv.<module>.<fn>` panic. The tests are the specification the
+implementation will have to satisfy.
 
-`host`, and three of the four modules declare nothing.
+## What the package contains
 
-| module | row | why |
-| --- | --- | --- |
-| `dotenvparse` | `[]` throughout | the grammar; the interpolation resolver is an argument |
-| `dotenvwrite` | `[]` throughout | rendering and editing a document |
-| `dotenvconf` | `[]` throughout | the conversion into config-core-nv's tree |
-| `dotenvload.load`, `.load_optional`, `.load_document`, `.save_document`, `.find_upwards`, `.is_world_readable` | `[fs]` | the file |
-| `dotenvload.environment`, `.environment_value` | `[io]` | the process environment |
-| `dotenvload.merged`, `.merged_optional` | `[fs, io]` | both |
-| `dotenvload.combine` and the accessors | `[]` | the policy, so it can be asserted without either |
-
-## What `std.env` declares, since the plan's row said `[env]`
-
-**`[io]`, and there is no `[env]` effect label.**  SPEC § 5.1's
-vocabulary puts pipes, processes and the environment together under
-`[io]`, so `env.get`, `env.vars` and `env.names` all declare `[io]` and
-nothing narrower exists to declare.  `dotenvload.environment` and
-`.environment_value` are the two functions in this package that carry
-it, and they are the only two.
-
-**And `std.env` has no `set`.**  Setting a variable is
-`process.env_set(name, value)`, in a different module, deliberately.
-That settles a design question this package would otherwise have had:
-"loading a `.env` file" here means **reading values**, never mutating
-the process.  `merged` answers the pairs a program should use and what
-the program does with them is the program's.
-
-That is the better shape anyway.  A program that takes its
-configuration as a value can be tested twice in one process with two
-different configurations; one that reads a global cannot.  Every
-`.env` library in every other language mutates the environment, and
-every one of them has an open issue about tests interfering with each
-other.
-
-## The load-bearing interface
-
-**`DotenvDocument` is a list of lines, not a map of keys.**
-
-A `.env` file is a file a person edits.  It has comments explaining why
-a value is what it is, a blank line between the database section and
-the mail section, and a commented-out override somebody left for next
-time.  It is usually in version control.
-
-Every other implementation of this format parses it into a map, and
-their `set_key` writes the map back — which rewrites the file, loses
-the comments, and produces a forty-line diff to change one value.  The
-practical consequence is that nobody uses the writer: people edit
-`.env` by hand and the library's write path is dead code with a bug in
-it.
-
-So `parse_document` keeps every line as it was written, `render` puts
-them back byte for byte, and `dotenvwrite.set` replaces **one line**.
-The round trip is one assertion — `render(parse_document(text)) ==
-text` — and it covers the whole of what the writer is for.
-
-What that unlocks is the rest of `dotenvwrite`: `comment_out` rather
-than `unset`, because that is what a person does when they want a value
-back later; `annotate`, so a tool that changes a value can say why
-beside it; and `to_template`, which turns a real `.env` into a
-`.env.example` with the keys and the comments and none of the secrets —
-so the example stops being a file somebody maintains by hand and
-forgets to update.
-
-The second decision is that **the interpolation resolver is a function
-the caller supplies**.  `dotenvparse.expand` takes a `fn(Str) -> ?Str`,
-which is what keeps the module `[]` — and it makes the lookup *order* a
-value rather than an assumption.  `dotenvload.resolver_over(entries,
-env)` is the order every implementation uses, written down: the file's
-own earlier lines first, then the process environment.  The other order
-would make a file unable to build a value out of its own earlier lines,
-which is what `${BASE}/x` is for.
-
-## The three value forms, which do not agree with each other
-
-This is the whole difficulty of the format, and none of it is visible
-when you look at a file.
-
-| written | means |
+| Module | Contents |
 | --- | --- |
-| `A='a\nb'` | six characters, with a backslash.  Literal throughout; no escapes, no interpolation, and no way to write a single quote inside |
-| `A="a\nb"` | five characters, with a newline.  Escapes processed, `${…}` interpolated |
-| `A=a\nb` | bare.  A `#` after whitespace ends the value; a `#` without whitespace before it does not |
+| `dotenvparse` | The grammar: the three value forms, the escape rules, interpolation, the options a parse takes, and every fault with the line it is on. |
+| `dotenvwrite` | The writer: render a document, replace one assignment, comment one out, add a note beside one, and turn a file into an example with the keys and none of the values. |
+| `dotenvload` | The file and the process environment: read one, write one back, search upwards for one, and combine the two under a policy. |
+| `dotenvconf` | The conversion into config-core-nv's value tree, so a `.env` can be stacked with the other sources of a program's configuration. |
 
-**The bare form's comment rule is the silent one.**
-`PASSWORD=abc#123` is the seven characters `abc#123`.
-`PASSWORD=abc #123` is the three characters `abc`.  One space, and the
-password is wrong — and the program does not fail, it authenticates as
-nobody, or connects to a database that accepts the connection and has
-none of the data.
+## How to choose an entry point
 
-`dotenvparse.value_ends_at` is that rule as a public named function
-precisely so a test can assert both halves of it directly, and so a
-reader who does not believe it can run it.
+**`dotenvload.merged` and `merged_optional` are what a program calls at
+startup.** They read the file, read the environment, apply the policy,
+and answer the pairs to use. `merged_optional` treats a missing file as
+the ordinary case, because a developer's machine has a `.env` and a
+production host does not.
 
-**`${VAR}` with no value is empty, not an error**, because that is what
-a shell does and what every existing file assumes.  A connection string
-with an empty `${DB_PASSWORD}` in it connects somewhere rather than
-failing — so `unresolved_names` and `dotenvload.unresolved_in` exist,
-and a program that wants a missing variable to be fatal asks for that
-list at start-up and refuses on its own terms.
+**`dotenvload.load` reads the file alone.** It declares `[fs]` and
+never touches the environment, for a caller that only wants what the
+file says.
 
-**`export FOO=bar` is an assignment**: the prefix is there so the file
-can be `source`d by a shell, it means nothing to a parser, and a parser
-that kept it produces a variable called `export FOO`.
+**`dotenvparse.parse` takes text the caller already holds.** It
+declares nothing at all. Use it when the bytes came from somewhere
+else.
 
-## Where this package sits next to config-nv
+**`dotenvload.load_document` and `dotenvwrite` are for changing a
+file.** The document keeps every line, `dotenvwrite.set` replaces one
+of them, and `dotenvload.save_document` writes it back.
 
-config-nv 0.0.1 already ships a `cfgdotenv` module with `parse_dotenv`,
-`read_dotenv`, `dotenv_layer` and `render_dotenv`.  That is not a
-duplicate to be resented; it is the front that was published first, and
-the plan's row for this package says config-nv is "the layered front"
-rather than the grammar's owner.
+**`dotenvconf.layer_of` turns entries into a configuration layer.** Use
+it when a `.env` is one of several sources and something else decides
+which wins.
 
-**The division this package proposes**: dotenv-nv owns the grammar —
-the three value forms, interpolation with defaults, multiline values,
-the comment-preserving document — and config-nv's `cfgdotenv` becomes
-an adapter over it, four functions deep instead of a second parser.
+## The rules a user needs
 
-Concretely, when both are implemented:
+1. **A `#` in a bare value ends it only after whitespace.**
+   `PASSWORD=abc#123` is the seven characters `abc#123`.
+   `PASSWORD=abc #123` is the three characters `abc`. One space changes
+   the password, and the program does not fail: it authenticates as
+   nobody. `dotenvparse.value_ends_at` is that rule, exposed, so a
+   caller can run it.
+2. **The three value forms have three different escape rules.** See the
+   table above. A single-quoted value cannot contain a single quote.
+3. **`${NAME}` with no value expands to nothing, and is not an error.**
+   That is what a shell does and what existing files assume. A
+   connection string with an empty `${DB_PASSWORD}` connects somewhere
+   rather than failing, so `dotenvparse.unresolved_names` and
+   `dotenvload.unresolved_in` answer which names were empty. A program
+   that wants a missing name to be fatal asks for that list at startup.
+4. **Interpolation happens in double-quoted values only.** It can be
+   turned off in `DotenvOptions` for a file the caller does not
+   control, because interpolation pulls the process environment into a
+   value.
+5. **`export FOO=bar` is an assignment to `FOO`.** A parser that kept
+   the prefix would produce a variable called `export FOO`.
+6. **The same key assigned twice is not a fault, and the last one
+   wins.** `dotenvparse.duplicate_keys` answers them, so a caller that
+   wants to refuse can.
+7. **This package never sets an environment variable.** The standard
+   library has no `env.set`; setting one is `process.env_set`, in
+   another module. Loading a file here means reading values. A program
+   that takes its configuration as a value can be tested twice in one
+   process with two different configurations.
+8. **The environment wins by default.** `DotenvKeepEnvironment` is the
+   policy that keeps `FOO=bar ./myprogram` working. It is an argument
+   on every function that combines the two sources, so there is one
+   spelling of the decision rather than one per entry point.
+9. **`shadowed_keys` is the answer to "I changed the file and nothing
+   happened".** It lists the keys the file assigned that the
+   environment already had.
+10. **The interpolation resolver is a function the caller supplies.**
+    `dotenvparse.expand` takes a `fn(Str) -> ?Str`, which is what keeps
+    the module free of effects. `dotenvload.resolver_over` builds the
+    ordinary one: the file's earlier entries first, then the
+    environment.
+11. **A document round-trips.** `dotenvwrite.render` of
+    `dotenvparse.parse_document` of a file's text is that text.
+    `dotenvwrite.set` replaces one line and leaves the rest as they
+    were, so changing one value produces a one-line difference.
+12. **Nothing searches for a file unless asked.**
+    `dotenvload.find_upwards` walks towards the filesystem root, and it
+    is a separate call, because a walk that surprised a caller by
+    reading a file two directories up is a walk that reads somebody
+    else's secrets.
+13. **A world-readable file is reported and not refused.**
+    `dotenvload.is_world_readable` is a question a caller may ask. A
+    container image where everything runs as one user is a good place
+    for a `.env` anyone on the machine can read.
+14. **`save_document` writes through a temporary file and a rename.** A
+    process that dies mid-write leaves the previous file rather than
+    half of the new one.
+15. **Values are strings, and nothing is guessed.**
+    `dotenvconf.layer_of` builds string values, because a `.env` file
+    has no types and guessing them turns `VERSION=1.10` into the number
+    1.1. `dotenvconf.layer_of_inferred` is the guess, under its own
+    name.
+16. **A parse is bounded.** `DotenvOptions` carries the largest file
+    accepted and the largest number of interpolation steps before a
+    value is called circular. `A=${B}` with `B=${A}` answers
+    `DotenvCircularInterpolation`.
+17. **Every fault carries the line it is on.** A `.env` file is a file
+    a person edits, and `dotenvparse.fault_line` is what sends them to
+    it.
 
-- `cfgdotenv.parse_dotenv(text, origin)` becomes
-  `dotenvparse.parse` followed by `dotenvparse.pairs_of`, with the
-  fault mapped — it already answers `[(Str, Str)]`, which is exactly
-  what `pairs_of` answers.
-- `cfgdotenv.read_dotenv(path)` becomes `dotenvload.load`.
-- `cfgdotenv.dotenv_layer(rule, path, name, rank)` becomes
-  `dotenvconf.layer_of` over that.
-- `cfgdotenv.render_dotenv(pairs)` becomes
-  `dotenvwrite.render_pairs` — and config-nv gains the
-  comment-preserving `set` it does not have today.
+## What is not included
 
-`dotenvconf` is the seam that makes that a small change rather than a
-rewrite: it hands config-core-nv's `EnvKeyRule` the pairs and adds
-nothing of its own, so a layer built through this package and a layer
-built through config-nv's own module are the same value.
+- **Setting the process environment.** See rule 7.
+- **Searching for a file by default.** See rule 12.
+- **Refusing a world-readable file.** See rule 13.
+- **Type inference.** See rule 15.
+- **Substitution in keys.** `${…}` is expanded in values only.
+- **`.env.local`, `.env.production` and the rest of the convention.**
+  Which files are read in which order for which deployment is a
+  decision [config-nv](https://novo-lang.org/packages/config-nv)'s
+  stack exists to express.
+- **A microcontroller build.** The package's subject is a file on a
+  host.
 
-**This is a report rather than an edit.**  config-nv is published and
-is not this lane's package; the division above is what its maintainers
-are being told about, and the row wants updating to say which package
-owns the grammar.
+## Related packages
 
-## Out of scope, and the next row: `datafile-nv`
+- [config-core-nv](https://novo-lang.org/packages/config-core-nv) is
+  the value tree and the precedence rules that a layered configuration
+  is made of. This package depends on it for one conversion:
+  `dotenvconf.layer_of` hands it entries and adds nothing of its own.
+- [config-nv](https://novo-lang.org/packages/config-nv) is the layered
+  front that stacks a `.env` beside a TOML file and the process
+  environment. Its `cfgdotenv` module carries a `.env` parser of its
+  own, published before this package existed. Both can be in one
+  program; a program that wants the grammar, the comment-preserving
+  document or the writer wants this one.
+- [datafile-nv](https://novo-lang.org/packages/datafile-nv) answers
+  where a program's configuration directory is on each platform. This
+  package reads `./.env`, which is a path relative to a project and not
+  a platform directory at all.
+- [toml-nv](https://novo-lang.org/packages/toml-nv),
+  [yaml-nv](https://novo-lang.org/packages/yaml-nv) and
+  [ini-nv](https://novo-lang.org/packages/ini-nv) are the other
+  configuration formats on the registry. They carry nesting and types;
+  a `.env` file is a flat list of strings.
+- `std.env` in the standard library reads the process environment. It
+  is what `dotenvload.environment` calls, and it declares `[io]`,
+  because the environment sits with pipes and processes in SPEC section
+  5.1.
 
-**Where a program's configuration, cache, data and state directories
-are is not this package's question**, and it is the next row in this
-section of the plan: `datafile-nv` (data/host, ports `directories` /
-`platformdirs`).
+## Tests
 
-It is a separate package because it is a separate kind of knowledge.
-This one parses a format; that one knows that a program's
-configuration lives in `$XDG_CONFIG_HOME/myapp` or
-`~/.config/myapp` on Linux, `~/Library/Application Support/myapp` on
-macOS, and `%APPDATA%\myapp` on Windows — four directory kinds times
-three platforms, plus the XDG variables that override each of them,
-plus the rule that a cache directory may be deleted at any moment and a
-state directory may not.
+```bash
+novo test --isolate tests/dotenvparse_tests.nv   # 14 tests: the grammar
+novo test --isolate tests/dotenvload_tests.nv    #  6 tests: the file and the policy
+```
 
-The overlap is exactly one function: `dotenvload.find_upwards` walks
-towards the filesystem root looking for a `.env`, which is a
-*project*-relative search and not a platform directory at all.  A
-program that wants `~/.config/myapp/config.toml` wants datafile-nv;
-one that wants `./.env` wants this.  Neither should grow the other's
-job — a dotenv library that knew about `%APPDATA%` would be one nobody
-could review.
+`dotenvy` is the reference for the grammar, including the three quoting
+forms and `${VAR}` with defaults. `python-dotenv` is the reference for
+the operational surface, particularly its `set_key` and `unset_key`.
 
-What `datafile-nv` would need from here: nothing.  What this package
-would want from it: nothing either, and that is the check that the
-split is in the right place.
+The suite asserts that `abc#123` and `abc #123` are different values,
+that a single-quoted value keeps its backslashes, that a double-quoted
+one turns `\n` into a newline, that `export` is not part of the key,
+that an unresolved `${NAME}` expands to nothing and is reported, that a
+circular interpolation stops, that rendering a parsed document gives
+back the text it came from, and that the environment shadows the file
+under the default policy.
 
-## What this does not do, on purpose
+The tests compile today and fail at run, each on the `not implemented`
+panic that is its body. That is the expected state of an interface
+release. They turn green one at a time as bodies land.
 
-- **It does not set environment variables.**  It cannot — `std.env`
-  has no `set` — and it should not; see above.
-- **It does not search for a file unless asked.**  `find_upwards` is a
-  separate call, because a walk that surprised a caller by reading a
-  file two directories above the one they named is a walk that reads
-  somebody else's secrets.
-- **It does not refuse a world-readable file.**  `is_world_readable` is
-  a question a caller can ask; a container image where everything runs
-  as one user is a perfectly good place for a mode-644 `.env`, and a
-  library that refused would be wrong about it.
-- **It does not guess types.**  `layer_of` builds string values,
-  because a `.env` file has no types and guessing them is how
-  `VERSION=1.10` becomes the number 1.1.  `layer_of_inferred` is the
-  guess, named.
-- **It does not do variable substitution in keys**, only in values.
-- **It does not support `.env.local`, `.env.production` and the rest.**
-  That convention is a framework's, and which files are loaded in which
-  order for which environment is exactly the decision config-nv's
-  `ConfigStack` exists to express.
-- **No device claim.**  The package is `host`.
+## Implementation status
 
-## The reference implementation
+Nothing is implemented, apart from the two constants. Every other
+function is declared with its signature and its effect row, and every
+body is a `todo()`.
 
-`dotenvy` (Rust) for the grammar — its handling of the three quoting
-forms and of `${VAR}` with defaults is what this ports — and
-`python-dotenv` for the operational surface, particularly its
-`set_key`/`unset_key`, which is the writer this package is trying to
-make good enough to use.
-
-Three things change in the port.
-
-Both references mutate the process environment and this one does not,
-for the reason the `std.env` section gives.
-
-`python-dotenv`'s `set_key` rewrites the file from a parsed map; here
-the document keeps its lines and `set` replaces one of them, which is
-what makes the writer something a person would let near a file they
-maintain.
-
-And both references default their override flag differently in
-different entry points — `dotenv_values` versus `load_dotenv`, with and
-without `override=True` — which is a thing people get wrong in both
-directions.  Here there is one `DotenvOverride` argument, it appears on
-every function that combines the two sources, and its default is the
-one that keeps `FOO=bar ./myprogram` working.
-
-## Status
-
-| item | implemented |
+| Item | Implemented |
 | --- | --- |
-| `dotenvparse` — `DotenvEntry`, `DotenvQuoting`, `DotenvLine`, `DotenvDocument`, `DotenvOptions`, `DotenvFault` | types only |
+| `dotenvload.DOTENV_FILE_NAME`, `.DOTENV_TEMPLATE_NAME` | yes (they are constants) |
 | `dotenvparse.default_options`, `.literal_options`, `.parse`, `.parse_document`, `.entries_of`, `.pairs_of` | no |
 | `dotenvparse.lookup`, `.duplicate_keys`, `.key_is_valid`, `.value_ends_at`, `.unescape` | no |
 | `dotenvparse.expand`, `.referenced_names`, `.unresolved_names`, `.default_of_reference`, `.name_of_reference` | no |
-| `dotenvparse.fault_line`, `.entry`, `.entry_quoted`, the `message` impl | no |
+| `dotenvparse.fault_line`, `.entry`, `.entry_quoted`, `DotenvFault.message` | no |
 | `dotenvwrite.render`, `.render_entry`, `.render_pairs` | no |
 | `dotenvwrite.set`, `.set_quoted`, `.unset`, `.comment_out`, `.annotate` | no |
 | `dotenvwrite.empty_document`, `.append`, `.append_comment`, `.append_blank` | no |
 | `dotenvwrite.quoting_for`, `.needs_quoting`, `.escape`, `.can_single_quote` | no |
 | `dotenvwrite.to_template`, `.missing_against` | no |
-| `dotenvload` — `DotenvOverride`, `DotenvLoaded`, `DotenvLoadFault` | types only |
-| `dotenvload.DOTENV_FILE_NAME`, `.DOTENV_TEMPLATE_NAME` | yes — they are constants |
 | `dotenvload.load`, `.load_optional`, `.load_document`, `.save_document`, `.find_upwards`, `.is_world_readable` | no |
 | `dotenvload.environment`, `.environment_value`, `.merged`, `.merged_optional`, `.combine` | no |
-| `dotenvload.pairs_of_loaded`, `.value_of`, `.shadowed_keys`, `.resolver_over`, `.unresolved_in`, the `message` impl | no |
+| `dotenvload.pairs_of_loaded`, `.value_of`, `.shadowed_keys`, `.resolver_over`, `.unresolved_in`, `DotenvLoadFault.message` | no |
 | `dotenvconf.layer_of`, `.layer_of_inferred`, `.value_of`, `.mapped_pairs`, `.skipped_entries`, `.bad_entries` | no |
 | `dotenvconf.rule_for`, `.path_for`, `.key_for`, `.keys_for`, `.template_for` | no |
+
+## Licence
+
+Apache-2.0. See `LICENSE`.
+
+<!-- docs/writing-a-readme.md is the style guide for this page. -->
