@@ -10,12 +10,6 @@ losing its comments, and hands the result to
 [config-core-nv](https://novo-lang.org/packages/config-core-nv) for a
 program that stacks several sources of configuration.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is
-declared with its full signature, but every body is a `todo()` that
-panics when called. The package is published so its design can be
-reviewed and depended on before it is implemented. Version 0.1.0 will
-be the first working release.
-
 ## What it is
 
 A file is a sequence of lines. A line is blank, a comment beginning
@@ -27,16 +21,17 @@ thing.
 | --- | --- |
 | `A=a\nb` | Bare. A `#` after whitespace ends the value; a `#` with no whitespace in front of it does not. |
 | `A='a\nb'` | Single-quoted. Literal throughout: no escape sequences, no interpolation, and no way to write a single quote inside. |
-| `A="a\nb"` | Double-quoted. Escape sequences are processed and `${…}` is interpolated. |
+| `A="a\nb"` | Double-quoted. The escape sequences `\n`, `\r`, `\t`, `\\`, `\"`, `\'` and `\$` are processed and `${…}` is interpolated. |
 
-`A='a\nb'` is therefore six characters including a backslash, and
-`A="a\nb"` is five characters including a newline.
+`A='a\nb'` is therefore four characters including a backslash, and
+`A="a\nb"` is three characters including a newline.
 
 **Interpolation** is `${NAME}` inside a double-quoted value, replaced
 by that name's value. `${NAME:-text}` supplies a default for when the
-name has none. The lookup order is the file's own earlier assignments
-first, then the process environment, which is what lets a file build
-`${BASE}/x` out of a line above it.
+name has no value at all. The lookup order is the file's own earlier
+assignments first, then the process environment, which is what lets a
+file build `${BASE}/x` out of a line above it. A reference to a later
+line finds nothing, so a file cannot loop.
 
 An assignment may carry the prefix `export`, so that the same file can
 be read by a shell with `source`. It means nothing to a parser.
@@ -84,10 +79,7 @@ fn main() [fs, io]
                 println("${key} came from the environment")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a `not implemented:
-dotenv-nv.<module>.<fn>` panic. The tests are the specification the
-implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test tests/`.
 
 ## What the package contains
 
@@ -112,7 +104,8 @@ file says.
 
 **`dotenvparse.parse` takes text the caller already holds.** It
 declares nothing at all. Use it when the bytes came from somewhere
-else.
+else. `dotenvparse.parse_with` does the same with an environment the
+caller passes in as a list of pairs.
 
 **`dotenvload.load_document` and `dotenvwrite` are for changing a
 file.** The document keeps every line, `dotenvwrite.set` replaces one
@@ -133,6 +126,8 @@ which wins.
 2. **The three value forms have three different escape rules.** See the
    table above. A single-quoted value cannot contain a single quote.
 3. **`${NAME}` with no value expands to nothing, and is not an error.**
+   `${NAME:-text}` uses its default only when the name has no value at
+   all; an empty value stays empty, as in python-dotenv.
    That is what a shell does and what existing files assume. A
    connection string with an empty `${DB_PASSWORD}` connects somewhere
    rather than failing, so `dotenvparse.unresolved_names` and
@@ -165,9 +160,13 @@ which wins.
     ordinary one: the file's earlier entries first, then the
     environment.
 11. **A document round-trips.** `dotenvwrite.render` of
-    `dotenvparse.parse_document` of a file's text is that text.
+    `dotenvparse.parse_document` of a file's text is that text. The
+    one exception is a file that mixes `\n` and `\r\n` endings, which
+    comes back with its first line's ending throughout.
     `dotenvwrite.set` replaces one line and leaves the rest as they
-    were, so changing one value produces a one-line difference.
+    were, so changing one value produces a one-line difference. A
+    changed line is written in the narrowest form that reads back as
+    the new value.
 12. **Nothing searches for a file unless asked.**
     `dotenvload.find_upwards` walks towards the filesystem root, and it
     is a separate call, because a walk that surprised a caller by
@@ -179,19 +178,23 @@ which wins.
     for a `.env` anyone on the machine can read.
 14. **`save_document` writes through a temporary file and a rename.** A
     process that dies mid-write leaves the previous file rather than
-    half of the new one.
+    half of the new one. An existing file keeps its permissions, and a
+    new one is readable by its owner alone.
 15. **Values are strings, and nothing is guessed.**
     `dotenvconf.layer_of` builds string values, because a `.env` file
     has no types and guessing them turns `VERSION=1.10` into the number
     1.1. `dotenvconf.layer_of_inferred` is the guess, under its own
     name.
 16. **A parse is bounded.** `DotenvOptions` carries the largest file
-    accepted and the largest number of interpolation steps before a
-    value is called circular. `A=${B}` with `B=${A}` answers
-    `DotenvCircularInterpolation`.
+    accepted. `dotenvparse.expand` follows an answer that itself holds a
+    reference, up to `max_expansions` deep, and past that answers
+    `DotenvCircularInterpolation`: `A=${B}` with `B=${A}` is refused
+    rather than followed forever.
 17. **Every fault carries the line it is on.** A `.env` file is a file
     a person edits, and `dotenvparse.fault_line` is what sends them to
-    it.
+    it. With `strict` off in `DotenvOptions`, a line that cannot be read
+    is kept as a skipped line with its fault, and the rest of the file
+    is read.
 
 ## What is not included
 
@@ -236,49 +239,27 @@ which wins.
 ## Tests
 
 ```bash
-novo test --isolate tests/dotenvparse_tests.nv   # 14 tests: the grammar
-novo test --isolate tests/dotenvload_tests.nv    #  6 tests: the file and the policy
+novo test tests/spec_tests.nv          #  7 tests: the grammar against its references
+novo test tests/dotenvparse_tests.nv   # 24 tests: values, interpolation and faults
+novo test tests/dotenvwrite_tests.nv   #  9 tests: rendering and the one-line edits
+novo test tests/dotenvload_tests.nv    # 12 tests: files, the environment and the policy
+novo test tests/dotenvconf_tests.nv    #  3 tests: the config-core-nv layer
+bash tests/coverage.sh                 # line coverage over src/
 ```
 
-`dotenvy` is the reference for the grammar, including the three quoting
-forms and `${VAR}` with defaults. `python-dotenv` is the reference for
-the operational surface, particularly its `set_key` and `unset_key`.
+The grammar's reference cases are python-dotenv's parser tests and
+dotenvy's quoting rules. `tests/spec_tests.nv` holds each case with the
+value it parses to. Where python-dotenv and this package agree, the
+expected value was checked against python-dotenv 1.0.1's
+`dotenv_values`. Where they differ, the test says so and follows
+dotenvy: a single-quoted value is not interpolated, `\$` in double
+quotes is a `$`, a bare value is not interpolated, and a quoted key or a
+line with no `=` is refused.
 
-The suite asserts that `abc#123` and `abc #123` are different values,
-that a single-quoted value keeps its backslashes, that a double-quoted
-one turns `\n` into a newline, that `export` is not part of the key,
-that an unresolved `${NAME}` expands to nothing and is reported, that a
-circular interpolation stops, that rendering a parsed document gives
-back the text it came from, and that the environment shadows the file
-under the default policy.
-
-The tests compile today and fail at run, each on the `not implemented`
-panic that is its body. That is the expected state of an interface
-release. They turn green one at a time as bodies land.
-
-## Implementation status
-
-Nothing is implemented, apart from the two constants. Every other
-function is declared with its signature and its effect row, and every
-body is a `todo()`.
-
-| Item | Implemented |
-| --- | --- |
-| `dotenvload.DOTENV_FILE_NAME`, `.DOTENV_TEMPLATE_NAME` | yes (they are constants) |
-| `dotenvparse.default_options`, `.literal_options`, `.parse`, `.parse_document`, `.entries_of`, `.pairs_of` | no |
-| `dotenvparse.lookup`, `.duplicate_keys`, `.key_is_valid`, `.value_ends_at`, `.unescape` | no |
-| `dotenvparse.expand`, `.referenced_names`, `.unresolved_names`, `.default_of_reference`, `.name_of_reference` | no |
-| `dotenvparse.fault_line`, `.entry`, `.entry_quoted`, `DotenvFault.message` | no |
-| `dotenvwrite.render`, `.render_entry`, `.render_pairs` | no |
-| `dotenvwrite.set`, `.set_quoted`, `.unset`, `.comment_out`, `.annotate` | no |
-| `dotenvwrite.empty_document`, `.append`, `.append_comment`, `.append_blank` | no |
-| `dotenvwrite.quoting_for`, `.needs_quoting`, `.escape`, `.can_single_quote` | no |
-| `dotenvwrite.to_template`, `.missing_against` | no |
-| `dotenvload.load`, `.load_optional`, `.load_document`, `.save_document`, `.find_upwards`, `.is_world_readable` | no |
-| `dotenvload.environment`, `.environment_value`, `.merged`, `.merged_optional`, `.combine` | no |
-| `dotenvload.pairs_of_loaded`, `.value_of`, `.shadowed_keys`, `.resolver_over`, `.unresolved_in`, `DotenvLoadFault.message` | no |
-| `dotenvconf.layer_of`, `.layer_of_inferred`, `.value_of`, `.mapped_pairs`, `.skipped_entries`, `.bad_entries` | no |
-| `dotenvconf.rule_for`, `.path_for`, `.key_for`, `.keys_for`, `.template_for` | no |
+The suites also assert that every accepted file renders back byte for
+byte, that a value changed by `set` reads back as itself in every
+quoting form, that `save_document` keeps a file's permissions, and that
+the environment shadows the file under the default policy.
 
 ## Licence
 

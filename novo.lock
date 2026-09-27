@@ -3,6 +3,6 @@
 [config-core-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.0.1"
-version = "0.0.1"
-hash = "c8c0a8aa5f3c823509498884d99142f23a760adbbfa7cf62de5cc2e6510ad8ff"
+req = "^0.1.0"
+version = "0.1.0"
+hash = "44d14ac64b9ffc87c1b25a451a9992ff3472dc4bfcff66ee9119dda3f1024d51"
