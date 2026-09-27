@@ -1,25 +1,21 @@
-// dotenvload_tests.nv — the file on disk and the override policy.
+// dotenvload_tests.nv — the file on disk, the process environment and
+// the override policy.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: dotenv-nv.dotenvload.<fn>`
-// before a file is opened.
-//
-// THE POLICY ASSERTIONS NEED NEITHER A FILE NOR AN ENVIRONMENT.
-// `combine` is `[]` — it takes the entries and the environment as
-// arguments — which is what lets both directions of the override rule
-// be asserted here without a filesystem.
+// `combine` takes the environment as an argument, so the policy is
+// asserted without a file.  The tests that need files write them under
+// the system's temporary directory.
 
 use std.test
 use std.list
 use dotenvparse
 use dotenvload
+use dotenvwrite
+use std.fs
+use std.env
+use std.path
 
 @test
 fn test_the_environment_wins_by_default() [io]
-    // `DATABASE_URL=… ./myprogram` is how a person overrides a setting
-    // for one run.  A loader that let the file win makes that command
-    // silently do nothing, which is the failure this default exists to
-    // prevent.
     let entries = [dotenvparse.entry("DATABASE_URL", "postgres://file/db")]
     let real_env = [("DATABASE_URL", "postgres://commandline/db")]
 
@@ -34,7 +30,6 @@ fn test_the_environment_wins_by_default() [io]
 
 @test
 fn test_the_other_policy_exists_and_is_chosen_by_name() [io]
-    // For a deployment tool that wrote the file and means it.
     let entries = [dotenvparse.entry("DATABASE_URL", "postgres://file/db")]
     let real_env = [("DATABASE_URL", "postgres://commandline/db")]
 
@@ -49,29 +44,20 @@ fn test_the_other_policy_exists_and_is_chosen_by_name() [io]
 
 @test
 fn test_a_missing_file_is_the_normal_state_of_a_production_host() [io, fs]
-    // A developer's machine has a `.env` and a production host does
-    // not, so a caller that had to match `DotenvFileAbsent` out of a
-    // `Result` would write that match in every program.
     let opts = dotenvparse.default_options()
 
     test.case("the optional form answers None")
     match dotenvload.load_optional("/nonexistent/.env", opts)
-        Ok(_)  => test.assert(true)
-        Err(_) => test.assert(true)
+        Ok(l)  => test.assert(l == None)
+        Err(_) => test.fail("a missing file is not a fault here")
 
     test.case("and the plain form names the path")
     match dotenvload.load("/nonexistent/.env", opts)
         Ok(_)  => test.fail("that file is not there")
-        Err(e) =>
-            match e
-                DotenvFileAbsent(_) => test.assert(true)
-                _                   => test.assert(true)
+        Err(e) => test.assert_eq(e, DotenvFileAbsent("/nonexistent/.env"))
 
 @test
 fn test_the_lookup_order_inside_a_file_is_its_own_lines_first() [io]
-    // The other order — environment first — makes a file unable to
-    // build a value out of its own earlier lines, which is what
-    // `${BASE}/x` is for.
     let entries = [dotenvparse.entry("BASE", "/srv/app")]
     let real_env = [("BASE", "/opt/other")]
 
@@ -93,7 +79,6 @@ fn test_the_names_this_format_is_looked_for_under() [io]
 
 @test
 fn test_the_loader_surface_is_complete() [io, fs]
-    // Every remaining `pub fn` of `dotenvload`, named once.
     let opts = dotenvparse.default_options()
 
     test.case("the environment reads, which are the only two in the package")
@@ -125,3 +110,164 @@ fn test_the_loader_surface_is_complete() [io, fs]
     match dotenvload.merged_optional("/nonexistent/.env", DotenvFileWins, opts)
         Ok(_)  => test.assert(true)
         Err(_) => test.assert(true)
+
+// A fresh directory for one test, under the temporary directory.  An
+// empty `TMPDIR` counts as none.
+fn scratch(name: Str) -> Str [fs, io]
+    var root = env.get("TMPDIR") ?? ""
+    if root == ""
+        root = "/tmp"
+    let dir = path.join(root, "dotenv-nv-tests-" + name)
+    fs.mkdir_all(dir)
+    for f in fs.read_dir(dir)
+        fs.delete(path.join(dir, f))
+    dir
+
+@test
+fn test_a_file_is_read_and_written_back() [io, fs]
+    let dir = scratch("rw")
+    let p = path.join(dir, ".env")
+    fs.write(p, "# db\nHOST=a\nURL=\"\${HOST}/x\"\n")
+    fs.set_file_mode(p, 416)
+    let opts = dotenvparse.default_options()
+
+    test.case("load answers the file's assignments and its path")
+    match dotenvload.load(p, opts)
+        Ok(l)  =>
+            test.assert_eq(l.path, p)
+            test.assert(dotenvload.pairs_of_loaded(l) == [("HOST", "a"), ("URL", "a/x")])
+        Err(_) => test.fail("the file is there")
+    match dotenvload.load_optional(p, opts)
+        Ok(l)  => test.assert(l != None)
+        Err(_) => test.fail("the file is there")
+
+    test.case("a document saved back keeps the file's mode")
+    match dotenvload.load_document(p, opts)
+        Err(_) => test.fail("the file is there")
+        Ok(d)  =>
+            match dotenvwrite.set(d, "HOST", "b")
+                Err(_) => test.fail("HOST is in the file")
+                Ok(d2) =>
+                    test.assert(dotenvload.save_document(p, d2) == None)
+                    test.assert_eq(fs.read(p) ?? "", "# db\nHOST=b\nURL=\"\${HOST}/x\"\n")
+                    test.assert_eq(fs.file_mode(p) ?? 0, 416)
+                    test.assert(not fs.exists(p + ".tmp"))
+
+    test.case("a new file is readable by its owner alone")
+    let fresh = path.join(dir, "new.env")
+    test.assert(dotenvload.save_document(fresh, dotenvwrite.empty_document()) == None)
+    test.assert_eq(fs.file_mode(fresh) ?? 0, 384)
+
+@test
+fn test_the_faults_a_file_can_raise() [io, fs]
+    let dir = scratch("faults")
+    let bad = path.join(dir, "bad.env")
+    fs.write(bad, "A=1\nB='open\n")
+    let opts = dotenvparse.default_options()
+
+    test.case("a parse fault carries the path and the grammar's fault")
+    let want = DotenvParseFault(bad, DotenvUnterminatedQuote(2, "'"))
+    match dotenvload.load(bad, opts)
+        Ok(_)  => test.fail("that quote never closes")
+        Err(e) => test.assert_eq(e, want)
+    match dotenvload.load_optional(bad, opts)
+        Ok(_)  => test.fail("that quote never closes")
+        Err(e) => test.assert_eq(e, want)
+    match dotenvload.merged(bad, DotenvKeepEnvironment, opts)
+        Ok(_)  => test.fail("that quote never closes")
+        Err(e) => test.assert_eq(e, want)
+
+    test.case("a directory is there and cannot be read as a file")
+    match dotenvload.load(dir, opts)
+        Ok(_)  => test.fail("a directory is not a file")
+        Err(e) => test.assert_eq(e, DotenvFileUnreadable(dir))
+
+    test.case("a file in a missing directory cannot be written")
+    let lost = path.join(dir, "no/such/dir/.env")
+    test.assert(dotenvload.save_document(lost, dotenvwrite.empty_document()) == Some(DotenvFileUnwritable(lost)))
+
+    test.case("a file cannot replace a directory, and the temporary file goes")
+    let sub = path.join(dir, "sub")
+    fs.mkdir_all(sub)
+    test.assert(dotenvload.save_document(sub, dotenvwrite.empty_document()) == Some(DotenvFileUnwritable(sub)))
+    test.assert(not fs.exists(sub + ".tmp"))
+
+@test
+fn test_the_walk_upwards_and_the_permissions_question() [io, fs]
+    let dir = scratch("walk")
+    let deep = path.join(dir, "a/b")
+    fs.mkdir_all(deep)
+    let p = path.join(dir, ".env-walk")
+    fs.write(p, "A=1\n")
+
+    test.case("the nearest file above the start is found")
+    match dotenvload.find_upwards(deep, ".env-walk")
+        Ok(found) => test.assert_eq(found, p)
+        Err(_)    => test.fail("the file is two levels up")
+
+    test.case("a name found nowhere up to the root")
+    match dotenvload.find_upwards(deep, ".env-dotenv-nv-nowhere")
+        Ok(_)  => test.fail("no directory holds that name")
+        Err(e) => test.assert_eq(e, DotenvNotFoundUpwards(deep))
+
+    test.case("a file others can read, and one they cannot")
+    fs.set_file_mode(p, 420)
+    test.assert(dotenvload.is_world_readable(p))
+    fs.set_file_mode(p, 384)
+    test.assert(not dotenvload.is_world_readable(p))
+
+@test
+fn test_merging_with_the_process_environment() [io, fs]
+    let dir = scratch("merge")
+    let p = path.join(dir, ".env")
+    let home = env.get("HOME") ?? ""
+    fs.write(p, "HOME=/from/file\nDOTENV_NV_ONLY=\"\${HOME}!\"\n")
+    let opts = dotenvparse.default_options()
+
+    test.case("the environment wins by default, and the file's key is reported")
+    match dotenvload.merged(p, DotenvKeepEnvironment, opts)
+        Err(_) => test.fail("the file is there")
+        Ok(l)  =>
+            test.assert_eq(dotenvload.value_of(l, "HOME"), Some(home))
+            test.assert_eq(dotenvload.shadowed_keys(l), ["HOME"])
+            test.assert_eq(dotenvload.value_of(l, "DOTENV_NV_ONLY"), Some("/from/file!"))
+            test.assert_eq(dotenvload.value_of(l, "PATH"), env.get("PATH"))
+
+    test.case("the file wins when asked")
+    match dotenvload.merged_optional(p, DotenvFileWins, opts)
+        Err(_) => test.fail("the file is there")
+        Ok(l)  => test.assert_eq(dotenvload.value_of(l, "HOME"), Some("/from/file"))
+
+    test.case("a missing file leaves the environment")
+    match dotenvload.merged_optional(path.join(dir, "absent"), DotenvKeepEnvironment, opts)
+        Err(_) => test.fail("a missing file is not a fault here")
+        Ok(l)  =>
+            test.assert_eq(dotenvload.value_of(l, "HOME"), Some(home))
+            test.assert_eq(l.path, path.join(dir, "absent"))
+    match dotenvload.merged(path.join(dir, "absent"), DotenvKeepEnvironment, opts)
+        Ok(_)  => test.fail("merged wants the file")
+        Err(e) => test.assert_eq(e, DotenvFileAbsent(path.join(dir, "absent")))
+
+@test
+fn test_combine_reports_a_key_once_and_keeps_order() [io]
+    let es = [dotenvparse.entry("A", "f1"), dotenvparse.entry("B", "f2"), dotenvparse.entry("A", "f3")]
+    let l = dotenvload.combine(es, [("C", "e0"), ("A", "e1")], DotenvKeepEnvironment)
+    test.assert(dotenvload.pairs_of_loaded(l) == [("A", "e1"), ("B", "f2"), ("A", "e1"), ("C", "e0")])
+    test.assert_eq(dotenvload.shadowed_keys(l), ["A"])
+    test.assert_eq(l.path, "")
+
+@test
+fn test_every_load_fault_has_a_message() [io]
+    let faults = [DotenvFileAbsent(".env"), DotenvFileUnreadable(".env"), DotenvFileUnwritable(".env"),
+                  DotenvParseFault(".env", DotenvEmptyKey(2)), DotenvFileIsWorldReadable(".env"),
+                  DotenvNotFoundUpwards("/srv")]
+    test.assert_eq(faults |> list.map(message_of),
+                   [".env: there is no such file",
+                    ".env: the file could not be read",
+                    ".env: the file could not be written",
+                    ".env: line 2: the assignment has no name",
+                    ".env: other users can read the file",
+                    "no file found in /srv or any directory above it"])
+
+fn message_of(f: DotenvLoadFault) -> Str
+    f.message()

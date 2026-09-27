@@ -1,0 +1,118 @@
+// spec_tests.nv — the cases python-dotenv's parser tests and dotenvy's
+// grammar agree on, written out with the value each one parses to.
+//
+// Each case is a file's text and the assignments it holds, shown as
+// `key=[value]` joined by `;`.  A case this package parses differently
+// from python-dotenv says so beside it.  The cases python-dotenv agrees
+// with were checked against python-dotenv 1.0.1's `dotenv_values`.
+//
+// `\$` is written escaped in the literals, because a bare `$` before a
+// brace in a novo-lang string interpolates the test's own scope.
+
+use std.test
+use std.list
+use std.str
+use dotenvparse
+
+// A file's assignments as `key=[value]` joined by `;`, or the line of
+// the fault.
+fn shown(text: Str, options: DotenvOptions) -> Str
+    match dotenvparse.parse(text, options)
+        Ok(es) => es |> list.map(one) |> str.join(";")
+        Err(f) => "fault@${dotenvparse.fault_line(f)}"
+
+fn one(e: DotenvEntry) -> Str
+    "${e.key}=[${e.value}]"
+
+// Each case, checked in order under `options`.
+fn check_all(cases: [(Str, Str)], options: DotenvOptions) [io]
+    for c in cases
+        test.case(c.0)
+        test.assert_eq(shown(c.0, options), c.1)
+
+@test
+fn test_bare_values_agree_with_python_dotenv() [io]
+    check_all([("", ""),
+               ("a=b", "a=[b]"),
+               ("a=b#c", "a=[b#c]"),
+               ("a=b #c", "a=[b]"),
+               ("a=b\t#c", "a=[b]"),
+               ("a=b c", "a=[b c]"),
+               ("a=b c ", "a=[b c]"),
+               (" a = b ", "a=[b]"),
+               ("a=  b", "a=[b]"),
+               ("a=#b", "a=[#b]"),
+               ("a=à", "a=[à]"),
+               ("a=\nb=c", "a=[];b=[c]"),
+               ("a=b\r\nc=d", "a=[b];c=[d]"),
+               ("a=b\n\n# note\nc=d\n", "a=[b];c=[d]")],
+              dotenvparse.default_options())
+
+@test
+fn test_the_export_prefix_agrees_with_python_dotenv() [io]
+    check_all([("export a=b", "a=[b]"),
+               ("export export_a=1", "export_a=[1]"),
+               ("export\ta=b", "a=[b]"),
+               ("export=1", "export=[1]")],
+              dotenvparse.default_options())
+
+@test
+fn test_quoted_values_agree_with_python_dotenv() [io]
+    check_all([("a='b c '", "a=[b c ]"),
+               ("a=\"b c \"", "a=[b c ]"),
+               ("a=\"b\\nc\"", "a=[b\nc]"),
+               ("a=\"b\\tc\"", "a=[b\tc]"),
+               ("a='b\\nc'", "a=[b\\nc]"),
+               ("a=\"b\nc\"", "a=[b\nc]"),
+               ("a=\"b\\\"c\"", "a=[b\"c]"),
+               ("a=\"b\\\\c\"", "a=[b\\c]"),
+               ("a=\"x\" # note", "a=[x]"),
+               ("a=\"\"", "a=[]"),
+               ("a=''", "a=[]"),
+               ("a='x\ny'\nb=c", "a=[x\ny];b=[c]")],
+              dotenvparse.default_options())
+
+@test
+fn test_interpolation_agrees_with_python_dotenv() [io]
+    check_all([("a=x\nc=\"\${a}\"", "a=[x];c=[x]"),
+               ("a=\"\${b:-c}\"", "a=[c]"),
+               ("a=\"\${b}\"", "a=[]"),
+               ("a=b\nc=\"\${a}\${a}\"", "a=[b];c=[bb]"),
+               ("a=x\na=y\nb=\"\${a}\"", "a=[x];a=[y];b=[y]"),
+               ("a=\"\${a}\"", "a=[]"),
+               ("a=\"\$b \$\"", "a=[\$b \$]")],
+              dotenvparse.default_options())
+
+@test
+fn test_where_this_package_follows_dotenvy_rather_than_python_dotenv() [io]
+    // python-dotenv interpolates a single-quoted value, and gives
+    // `c='${a}'` the value `x`; dotenvy keeps it literal.
+    // python-dotenv keeps `\$` as two characters; dotenvy reads a `$`.
+    // python-dotenv reads a bare value's `${a}`; this package reads it
+    // as written.  python-dotenv accepts a quoted key and a line with no
+    // `=`; dotenvy refuses both.
+    check_all([("a=x\nc='\${a}'", "a=[x];c=[\${a}]"),
+               ("a=\"\\\$b\"", "a=[\$b]"),
+               ("a=x\nc=\${a}", "a=[x];c=[\${a}]"),
+               ("'a'=b", "fault@1"),
+               ("no_value", "fault@1"),
+               ("a='b\\'c'", "fault@1")],
+              dotenvparse.default_options())
+
+@test
+fn test_interpolation_can_be_turned_off() [io]
+    check_all([("a=x\nc=\"\${a}\"", "a=[x];c=[\${a}]"),
+               ("c=\"\${a}\\n\"", "c=[\${a}\n]")],
+              dotenvparse.literal_options())
+
+@test
+fn test_every_refusal_names_its_line() [io]
+    check_all([("a=1\n=b", "fault@2"),
+               ("a=1\nb c=d", "fault@2"),
+               ("a=1\nb=\"never", "fault@2"),
+               ("a=1\nb='never", "fault@2"),
+               ("a=\"x\ny\" z", "fault@2"),
+               ("a=\"\\q\"", "fault@1"),
+               ("a=\"\${b\"", "fault@1"),
+               ("a=1\nb=\"x\ny\"\nc", "fault@4")],
+              dotenvparse.default_options())

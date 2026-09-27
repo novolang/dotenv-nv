@@ -1,0 +1,53 @@
+// dotenvconf_tests.nv — a file's assignments as a config-core-nv layer,
+// under the rules config-core-nv already has.
+
+use std.test
+use std.list
+use dotenvparse
+use dotenvconf
+use cfgvalue
+use cfgenvkeys
+
+fn entries() -> [DotenvEntry]
+    [dotenvparse.entry("MYAPP__DB__HOST", "db1"),
+     dotenvparse.entry("MYAPP__DB__PORT", "5432"),
+     dotenvparse.entry("MYAPP__VERSION", "1.10"),
+     dotenvparse.entry("HOME", "/root")]
+
+@test
+fn test_the_prefix_gains_a_separator() [io]
+    test.assert_eq(dotenvconf.rule_for("MYAPP").prefix, "MYAPP__")
+    test.assert_eq(dotenvconf.rule_for("APP_").prefix, "APP_")
+    test.assert_eq(dotenvconf.rule_for("").prefix, "")
+
+@test
+fn test_values_stay_strings_unless_asked() [io]
+    let r = dotenvconf.rule_for("MYAPP")
+    let tree = dotenvconf.value_of(r, entries())
+    test.case("a layer built by layer_of holds the text")
+    match cfgvalue.field(tree, "version")
+        Some(v) => test.assert(v == CfgStr("1.10"))
+        None    => test.fail("version is set")
+    test.case("the inferred layer holds numbers")
+    let inferred = dotenvconf.layer_of_inferred(r, entries(), ".env", 5)
+    match cfgvalue.field(inferred.root, "version")
+        Some(v) => test.assert(v == CfgFloat(1.1))
+        None    => test.fail("version is set")
+    test.case("and equals config-core-nv's layer over the same pairs")
+    let plain = dotenvconf.layer_of(r, entries(), ".env", 5)
+    let direct = cfgenvkeys.layer_from(cfgenvkeys.rule("MYAPP__"), [("MYAPP__DB__HOST", "db1"),
+        ("MYAPP__DB__PORT", "5432"), ("MYAPP__VERSION", "1.10"), ("HOME", "/root")],
+        ".env", 5)
+    test.assert(inferred.root == direct.root)
+    test.assert_eq(plain.name, ".env")
+
+@test
+fn test_the_mapping_is_inspectable() [io]
+    let r = dotenvconf.rule_for("MYAPP")
+    test.assert(dotenvconf.mapped_pairs(r, entries()) == [("db.host", "db1"), ("db.port", "5432"),
+        ("version", "1.10")])
+    test.assert(dotenvconf.skipped_entries(r, entries()) == [("HOME", "/root")])
+    test.assert_eq(list.len(dotenvconf.bad_entries(r, entries())), 0)
+    test.assert_eq(dotenvconf.path_for(r, "OTHER"), None)
+    test.assert_eq(dotenvconf.key_for(r, "a-b"), None)
+    test.assert_eq(dotenvconf.keys_for(r, ["db.host", "a-b", "version"]), ["MYAPP__DB__HOST", "MYAPP__VERSION"])

@@ -1,14 +1,8 @@
 // dotenvparse_tests.nv — the three value forms, the comment that is
-// sometimes part of the value, and the round trip that is this
-// package's whole promise about writing.
+// sometimes part of a value, interpolation, and the faults.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: dotenv-nv.<module>.<fn>`.
-//
-// NOTE ON THE SOURCE: `\$` is written escaped throughout, because a
-// bare `$` before a letter or a brace inside a novo-lang string literal
-// is an interpolation of the TEST's own scope rather than the text
-// this package is meant to parse.
+// `\$` is written escaped throughout, because a bare `$` before a
+// brace in a novo-lang string interpolates the test's own scope.
 
 use std.test
 use std.list
@@ -28,9 +22,8 @@ fn home_resolves(name: Str) -> ?Str
 
 @test
 fn test_single_quotes_are_literal_and_double_quotes_are_not() [io]
-    // `'a\nb'` is six characters with a backslash in it.  `"a\nb"` is
-    // five with a newline.  Nothing in a file says which you are
-    // looking at except the quote character.
+    // `'a\nb'` is four characters with a backslash in them, and
+    // `"a\nb"` is three with a newline.
     let opts = dotenvparse.default_options()
 
     test.case("a single-quoted backslash-n stays two characters")
@@ -56,10 +49,8 @@ fn test_single_quotes_are_literal_and_double_quotes_are_not() [io]
 
 @test
 fn test_a_hash_ends_an_unquoted_value_only_after_whitespace() [io]
-    // `PASSWORD=abc#123` is seven characters.  `PASSWORD=abc #123` is
-    // three.  One space, silently, and the program authenticates as
-    // nobody — it does not fail, which is what makes this the worst
-    // thing in the format.
+    // `PASSWORD=abc#123` is seven characters and `PASSWORD=abc #123` is
+    // three.
     test.case("a hash with no space before it is part of the value")
     test.assert_eq(dotenvparse.value_ends_at("abc#123"), 7)
 
@@ -74,9 +65,7 @@ fn test_a_hash_ends_an_unquoted_value_only_after_whitespace() [io]
 
 @test
 fn test_a_quoted_value_keeps_its_hash_whatever_the_spacing() [io]
-    // The comment rule is the BARE form's alone, which is the other
-    // half of the same trap: a value that needed a `#` is written in
-    // quotes and then it is safe.
+    // The comment rule belongs to the bare form alone.
     let opts = dotenvparse.default_options()
     match dotenvparse.parse("P=\"abc #123\"\n", opts)
         Err(_) => test.fail("that is a legal double-quoted value")
@@ -86,8 +75,7 @@ fn test_a_quoted_value_keeps_its_hash_whatever_the_spacing() [io]
 
 @test
 fn test_export_is_a_prefix_and_not_part_of_the_key() [io]
-    // The prefix is there so the file can be `source`d by a shell.  A
-    // parser that kept it produces a variable called `export FOO`.
+    // The prefix lets a shell `source` the file.
     let opts = dotenvparse.default_options()
     match dotenvparse.parse("export FOO=bar\n", opts)
         Err(_) => test.fail("that is an ordinary assignment")
@@ -100,8 +88,6 @@ fn test_export_is_a_prefix_and_not_part_of_the_key() [io]
 
 @test
 fn test_interpolation_resolves_through_the_callers_function() [io]
-    // The resolver is an argument, which is what keeps this module `[]`
-    // and what makes the lookup order visible rather than assumed.
     let opts = dotenvparse.default_options()
 
     test.case("a name the resolver knows is substituted")
@@ -121,9 +107,6 @@ fn test_interpolation_resolves_through_the_callers_function() [io]
 
 @test
 fn test_an_empty_expansion_is_something_a_caller_can_refuse() [io]
-    // A connection string with an empty `${DB_PASSWORD}` in it connects
-    // to the wrong place rather than failing.  This is the function
-    // that turns the format's most forgiving behaviour into a check.
     test.case("what the value referenced")
     let names = dotenvparse.referenced_names("postgres://u:\${DB_PASSWORD}@h/db")
     test.assert_eq(list.len(names), 1)
@@ -142,23 +125,28 @@ fn test_an_empty_expansion_is_something_a_caller_can_refuse() [io]
 
 @test
 fn test_circular_interpolation_is_refused_rather_than_looped() [io]
-    // `A=${B}` and `B=${A}` is a file somebody writes by accident, and
-    // a loader without a ceiling spins on it.
+    // A parse resolves against earlier lines only, so it cannot loop.
+    // `expand` follows an answer that holds a reference, and stops at
+    // `max_expansions`.
     let opts = dotenvparse.default_options()
-    test.assert(opts.max_expansions > 0)
+    test.assert_eq(opts.max_expansions, 32)
 
-    test.case("the ceiling is in the options rather than compiled in")
-    match dotenvparse.parse("A=\${B}\nB=\${A}\n", opts)
-        Ok(_)  => test.assert(true)
+    test.case("a parse gives each an empty value")
+    match dotenvparse.parse("A=\"\${B}\"\nB=\"\${A}\"\n", opts)
+        Ok(es) => test.assert_eq(es[1].value, "")
+        Err(_) => test.fail("a reference to a later line is empty")
+
+    test.case("expand over the two refuses")
+    let loop_env = [dotenvparse.entry("A", "\${B}"), dotenvparse.entry("B", "\${A}")]
+    let over_loop = name => dotenvparse.lookup(loop_env, name)
+    match dotenvparse.expand("\${A}", over_loop, 3, opts)
+        Ok(_)  => test.fail("that chain never settles")
         Err(e) =>
-            match e
-                DotenvCircularInterpolation(_, _) => test.assert(true)
-                _                                 => test.assert(true)
+            test.assert_eq(e, DotenvCircularInterpolation("A", 33))
+            test.assert_eq(dotenvparse.fault_line(e), 0)
 
 @test
 fn test_every_fault_carries_a_line_number() [io]
-    // A `.env` file is a file a person edits, and a fault without a
-    // line number is one they cannot act on.
     let opts = dotenvparse.default_options()
 
     test.case("an unterminated quote names its line")
@@ -177,9 +165,6 @@ fn test_every_fault_carries_a_line_number() [io]
 
 @test
 fn test_the_last_assignment_wins_and_both_are_reported() [io]
-    // The last one winning is what every other implementation does and
-    // what a file with a commented-out override relies on.  A caller
-    // that wants to refuse asks for the duplicates.
     let opts = dotenvparse.default_options()
     match dotenvparse.parse("A=first\nA=second\n", opts)
         Err(_) => test.fail("two assignments to one key is legal")
@@ -194,10 +179,6 @@ fn test_the_last_assignment_wins_and_both_are_reported() [io]
 
 @test
 fn test_a_document_round_trips_byte_for_byte() [io]
-    // The whole promise this package makes about writing: a `.env` is a
-    // file a person edits, with comments and blank lines and an order,
-    // and a writer that reordered it or dropped its comments makes a
-    // forty-line diff to change one value.
     let text = "# the database\nDB_HOST=localhost\n\n# mail\n# SMTP_HOST=disabled for now\nSMTP_PORT=587\n"
     let opts = dotenvparse.default_options()
 
@@ -218,8 +199,6 @@ fn test_a_document_round_trips_byte_for_byte() [io]
 
 @test
 fn test_the_quoting_is_chosen_by_the_value() [io]
-    // A writer that always double-quoted turns a literal `$HOME` into
-    // an interpolation on the next read.
     test.case("a plain value needs no quotes")
     test.assert(not dotenvwrite.needs_quoting("localhost"))
     match dotenvwrite.quoting_for("localhost")
@@ -239,7 +218,6 @@ fn test_the_quoting_is_chosen_by_the_value() [io]
 
 @test
 fn test_the_writer_surface_is_complete() [io]
-    // Every remaining `pub fn` of `dotenvwrite`, named once.
     let e = dotenvparse.entry("A", "1")
     test.assert(str.len(dotenvwrite.render_entry(e)) > 0)
     test.assert(str.len(dotenvwrite.render_pairs([("A", "1")])) > 0)
@@ -269,7 +247,6 @@ fn test_the_writer_surface_is_complete() [io]
 
 @test
 fn test_the_parse_surface_is_complete() [io]
-    // Every remaining `pub fn` of `dotenvparse`, named once.
     let opts = dotenvparse.literal_options()
     test.assert(not opts.interpolate)
     test.assert(opts.max_bytes > 0)
@@ -292,9 +269,6 @@ fn test_the_parse_surface_is_complete() [io]
 
 @test
 fn test_the_config_seam_is_one_call() [io]
-    // A `.env` file is flat and a configuration is a tree, and
-    // config-core-nv already decided how a flat key becomes a path.
-    // This module hands it the pairs and adds nothing of its own.
     let rule = dotenvconf.rule_for("MYAPP")
     let entries = [dotenvparse.entry("MYAPP__DB__HOST", "localhost")]
 
@@ -325,4 +299,143 @@ fn test_the_config_seam_is_one_call() [io]
         None    => test.fail("db is a table in the tree")
 
     test.case("and a template generated from the program's own paths")
-    test.assert(list.len(dotenvparse.entries_of(dotenvconf.template_for(rule, ["db.host"]))) >= 0)
+    let t = dotenvconf.template_for(rule, ["db.host", "bad-path"])
+    test.assert_eq(dotenvwrite.render(t), "# MYAPP__DB__HOST=\n")
+
+@test
+fn test_a_parse_that_is_not_strict_keeps_what_it_cannot_read() [io]
+    let opts = options_with(false, true, true, 1048576)
+    let text = "A=1\nnot an assignment\nB='open\nC=3\n"
+    match dotenvparse.parse_document(text, opts)
+        Err(_) => test.fail("a parse that is not strict skips the line")
+        Ok(d)  =>
+            test.case("the readable assignments are there")
+            test.assert(dotenvparse.pairs_of(d) == [("A", "1"), ("C", "3")])
+            test.case("each skipped line keeps its text and its fault")
+            test.assert_eq(d.lines[1], DotenvSkippedLine("not an assignment",
+                DotenvNotAnAssignment(2, "not an assignment")))
+            test.assert_eq(d.lines[2], DotenvSkippedLine("B='open", DotenvUnterminatedQuote(3, "'")))
+            test.case("and the document renders back as it was")
+            test.assert_eq(dotenvwrite.render(d), text)
+
+@test
+fn test_the_options_limit_what_a_parse_accepts() [io]
+    let opts = options_with(true, true, true, 8)
+    test.case("a file past the size limit")
+    test.assert(dotenvparse.parse("A=123456789\n", opts) == Err(DotenvTooLong(12, 8)))
+
+    let one_line = options_with(true, false, true, 1048576)
+    test.case("a quoted value across two lines, when that is refused")
+    test.assert(dotenvparse.parse("A=1\nB=\"x\ny\"\n", one_line) == Err(DotenvMultilineNotAllowed(2)))
+
+    let no_export = options_with(true, true, false, 1048576)
+    test.case("the export prefix, when that is refused")
+    test.assert(dotenvparse.parse("export A=1\n", no_export) == Err(DotenvBadKey(1, "export A")))
+
+@test
+fn test_line_endings_and_line_numbers() [io]
+    let opts = dotenvparse.default_options()
+    match dotenvparse.parse_document("A=1\r\nB=\"x\r\ny\"\r\nC=3", opts)
+        Err(_) => test.fail("a file with CRLF endings")
+        Ok(d)  =>
+            test.case("a CRLF file is read with plain newlines in its values")
+            test.assert(dotenvparse.pairs_of(d) == [("A", "1"), ("B", "x\ny"), ("C", "3")])
+            test.case("the ending and the missing final newline are kept")
+            test.assert_eq(d.newline, "\r\n")
+            test.assert(not d.final_newline)
+            test.case("a line after a two-line value is numbered from the file")
+            test.assert_eq(dotenvparse.entries_of(d)[2].line, 4)
+
+@test
+fn test_every_escape_sequence() [io]
+    test.assert(dotenvparse.unescape("\\n\\r\\t\\\\\\\"\\'\\$", 1) == Ok("\n\r\t\\\"'\$"))
+    test.case("a backslash before anything else is refused with its line")
+    test.assert(dotenvparse.unescape("a\\qb", 7) == Err(DotenvBadEscape(7, "\\q")))
+    test.assert(dotenvparse.unescape("a\\", 2) == Err(DotenvBadEscape(2, "\\")))
+    test.case("unescape leaves a reference alone")
+    test.assert(dotenvparse.unescape("\${A}", 1) == Ok("\${A}"))
+
+@test
+fn test_expand_follows_a_chain_and_refuses_a_broken_one() [io]
+    let opts = dotenvparse.default_options()
+    let es = [dotenvparse.entry("ROOT", "/srv"), dotenvparse.entry("BASE", "\${ROOT}/app")]
+    let over = name => dotenvparse.lookup(es, name)
+    test.case("an answer holding a reference is expanded in turn")
+    test.assert(dotenvparse.expand("\${BASE}/bin", over, 1, opts) == Ok("/srv/app/bin"))
+    test.case("a reference with no closing brace")
+    test.assert(dotenvparse.expand("x\${BASE", over, 4, opts) == Err(DotenvUnterminatedInterpolation(4)))
+    test.case("a dollar without a brace is kept")
+    test.assert(dotenvparse.expand("\$5 and \$", over, 1, opts) == Ok("\$5 and \$"))
+
+@test
+fn test_references_are_read_out_of_a_value() [io]
+    test.assert_eq(dotenvparse.referenced_names("\${A}-\${B:-x}-\${C"), ["A", "B"])
+    test.assert_eq(dotenvparse.referenced_names("plain"), [])
+    test.case("a reference with a default is not unresolved")
+    test.assert_eq(dotenvparse.unresolved_names("\${A}\${B:-x}", nothing_resolves), ["A"])
+    test.assert_eq(dotenvparse.default_of_reference("A"), None)
+    test.assert_eq(dotenvparse.name_of_reference("A"), "A")
+    test.assert_eq(dotenvparse.default_of_reference("A:-"), Some(""))
+
+@test
+fn test_keys_and_the_end_of_a_bare_value() [io]
+    test.assert(dotenvparse.key_is_valid("_A1"))
+    test.assert(not dotenvparse.key_is_valid(""))
+    test.assert(not dotenvparse.key_is_valid("A-B"))
+    test.assert(not dotenvparse.key_is_valid("A.B"))
+    test.assert_eq(dotenvparse.value_ends_at(""), 0)
+    test.assert_eq(dotenvparse.value_ends_at("#x"), 2)
+    test.assert_eq(dotenvparse.value_ends_at("a \t#x"), 1)
+    test.assert_eq(dotenvparse.value_ends_at("a  "), 1)
+
+@test
+fn test_duplicates_carry_both_lines() [io]
+    match dotenvparse.parse("A=1\nB=2\nA=3\nA=4\n", dotenvparse.default_options())
+        Err(_) => test.fail("four ordinary assignments")
+        Ok(es) =>
+            test.assert_eq(dotenvparse.duplicate_keys(es),
+                           [DotenvDuplicateKey(3, "A", 1), DotenvDuplicateKey(4, "A", 1)])
+
+@test
+fn test_a_parse_with_an_environment_reads_it_after_the_file() [io]
+    let env = [("HOST", "env-host"), ("PORT", "1")]
+    match dotenvparse.parse_with("PORT=2\nURL=\"\${HOST}:\${PORT}\"\n", dotenvparse.default_options(), env)
+        Err(_) => test.fail("two ordinary assignments")
+        Ok(d)  => test.assert_eq(dotenvparse.lookup(dotenvparse.entries_of(d), "URL"), Some("env-host:2"))
+
+@test
+fn test_every_fault_has_a_message_and_a_line() [io]
+    let faults = [DotenvNotAnAssignment(1, "x"),
+                  DotenvBadKey(2, "a-b"),
+                  DotenvEmptyKey(3),
+                  DotenvUnterminatedQuote(4, "\""),
+                  DotenvUnterminatedInterpolation(5),
+                  DotenvBadEscape(6, "\\q"),
+                  DotenvCircularInterpolation("A", 33),
+                  DotenvTooLong(10, 8),
+                  DotenvMultilineNotAllowed(9),
+                  DotenvDuplicateKey(10, "A", 1)]
+    test.assert_eq(faults |> list.map(dotenvparse.fault_line), [1, 2, 3, 4, 5, 6, 0, 0, 9, 10])
+    test.assert_eq(faults |> list.map(message_of),
+                   ["line 1: not an assignment: x",
+                    "line 2: 'a-b' is not a legal variable name",
+                    "line 3: the assignment has no name",
+                    "line 4: the value's \" is never closed",
+                    "line 5: a reference has no closing brace",
+                    "line 6: \\q is not an escape sequence",
+                    "the reference to A did not settle after 33 steps",
+                    "the file is 10 bytes, and the limit is 8",
+                    "line 9: a value spans lines, and this parse does not allow it",
+                    "line 10: A was already assigned on line 1"])
+
+fn message_of(f: DotenvFault) -> Str
+    f.message()
+
+// The default options with four of them chosen.
+fn options_with(strict: Bool, multiline: Bool, export: Bool, most: Int) -> DotenvOptions
+    DotenvOptions { interpolate: true,
+        allow_export: export,
+        allow_multiline: multiline,
+        strict: strict,
+        max_bytes: most,
+        max_expansions: 32 }

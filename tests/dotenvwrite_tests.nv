@@ -1,0 +1,142 @@
+// dotenvwrite_tests.nv — rendering, the one-line edits, the quoting a
+// changed value gets, and the template.
+
+use std.test
+use dotenvparse
+use dotenvwrite
+
+fn doc(text: Str) -> DotenvDocument
+    match dotenvparse.parse_document(text, dotenvparse.default_options())
+        Ok(d)  => d
+        Err(_) => dotenvwrite.empty_document()
+
+fn edited(r: Result<DotenvDocument, DotenvFault>) -> Str
+    match r
+        Ok(d)  => dotenvwrite.render(d)
+        Err(f) => f.message()
+
+@test
+fn test_every_accepted_file_renders_back_as_it_was() [io]
+    let texts = ["",
+                 "\n",
+                 "A=1",
+                 "  \t\n# c\n   # indented\nA = 1 # note\n",
+                 "export A='x'\nB=\"a\\nb \${A}\"   # trailing\n",
+                 "K=\"line one\nline two\"\nL=2\n",
+                 "A=1\r\nB=2\r\n",
+                 "A=1\r\n\r\n# c\r\nB=\"x\r\ny\"\r\n"]
+    for t in texts
+        test.case(t)
+        test.assert_eq(dotenvwrite.render(doc(t)), t)
+
+@test
+fn test_set_replaces_one_line() [io]
+    let d = doc("# db\nexport HOST=old # was\nPORT=1\nHOST=older\n")
+    test.case("the last assignment changes, keeping its prefix, and nothing else does")
+    test.assert_eq(edited(dotenvwrite.set(d, "HOST", "new")),
+                   "# db\nexport HOST=old # was\nPORT=1\nHOST=new\n")
+    test.case("a key not in the file is appended")
+    test.assert_eq(edited(dotenvwrite.set(d, "USER", "me")),
+                   "# db\nexport HOST=old # was\nPORT=1\nHOST=older\nUSER=me\n")
+    test.case("an exported assignment stays exported")
+    test.assert_eq(edited(dotenvwrite.set(doc("export A=1\n"), "A", "2")), "export A=2\n")
+    test.case("a key that is not a name is refused")
+    test.assert_eq(edited(dotenvwrite.set(d, "A B", "x")), "line 0: 'A B' is not a legal variable name")
+
+@test
+fn test_set_keeps_the_form_when_it_can() [io]
+    test.case("a double-quoted value stays double-quoted")
+    test.assert_eq(edited(dotenvwrite.set(doc("A=\"x\"\n"), "A", "y")), "A=\"y\"\n")
+    test.case("a single-quoted value stays single-quoted")
+    test.assert_eq(edited(dotenvwrite.set(doc("A='x'\n"), "A", "\$y")), "A='\$y'\n")
+    test.case("unless the value holds a single quote")
+    test.assert_eq(edited(dotenvwrite.set(doc("A='x'\n"), "A", "it's")), "A=\"it's\"\n")
+    test.case("a bare value that needs quotes gets the narrowest")
+    test.assert_eq(edited(dotenvwrite.set(doc("A=x\n"), "A", "a b")), "A='a b'\n")
+    test.assert_eq(edited(dotenvwrite.set(doc("A=x\n"), "A", "y")), "A=y\n")
+    test.case("a new key's form is chosen by its value")
+    test.assert_eq(edited(dotenvwrite.set(doc(""), "A", "a\tb")), "A=\"a\\tb\"")
+    test.case("set_quoted writes the form it is given")
+    test.assert_eq(edited(dotenvwrite.set_quoted(doc("A=1\n"), "A", "1", DotenvSingleQuoted)), "A='1'\n")
+    test.assert_eq(edited(dotenvwrite.set_quoted(doc("A=1\n"), "B C", "1", DotenvSingleQuoted)),
+                   "line 0: 'B C' is not a legal variable name")
+
+@test
+fn test_a_changed_value_reads_back_as_itself() [io]
+    let values = ["plain",
+        "",
+        "a b",
+        "\$HOME/bin",
+        "C:\\dir",
+        "it's",
+        "x\ny",
+        "q\"q",
+        "tab\there",
+        "#hash",
+        "cr\rlf"]
+    for v in values
+        test.case(v)
+        match dotenvwrite.set(dotenvwrite.empty_document(), "K", v)
+            Err(_) => test.fail("K is a legal name")
+            Ok(d)  =>
+                match dotenvparse.parse(dotenvwrite.render(d), dotenvparse.default_options())
+                    Ok(es) => test.assert_eq(es[0].value, v)
+                    Err(_) => test.fail("the writer wrote something the parser refuses")
+
+@test
+fn test_unset_comment_out_and_annotate() [io]
+    let d = doc("# keep\nA=1\nB=\"x\ny\"\nA=2\n")
+    test.case("unset removes every assignment to the key and keeps the comment")
+    test.assert_eq(edited(dotenvwrite.unset(d, "A")), "# keep\nB=\"x\ny\"\n")
+    test.case("comment_out turns every line of the assignment into a comment")
+    test.assert_eq(edited(dotenvwrite.comment_out(d, "B")), "# keep\nA=1\n# B=\"x\n# y\"\nA=2\n")
+    test.case("annotate adds a comment above the last assignment")
+    test.assert_eq(edited(dotenvwrite.annotate(d, "A", "why")), "# keep\nA=1\nB=\"x\ny\"\n# why\nA=2\n")
+    test.assert_eq(edited(dotenvwrite.annotate(d, "A", "# why")), "# keep\nA=1\nB=\"x\ny\"\n# why\nA=2\n")
+    test.case("a key the document does not assign leaves it as it was")
+    test.assert_eq(edited(dotenvwrite.unset(d, "Z")), dotenvwrite.render(d))
+    test.assert_eq(edited(dotenvwrite.comment_out(d, "Z")), dotenvwrite.render(d))
+    test.assert_eq(edited(dotenvwrite.annotate(d, "Z", "x")), dotenvwrite.render(d))
+    test.case("each refuses a key that is not a name")
+    test.assert_eq(edited(dotenvwrite.unset(d, "1")), "line 0: '1' is not a legal variable name")
+    test.assert_eq(edited(dotenvwrite.comment_out(d, "1")), "line 0: '1' is not a legal variable name")
+    test.assert_eq(edited(dotenvwrite.annotate(d, "1", "x")), "line 0: '1' is not a legal variable name")
+
+@test
+fn test_building_a_file_from_nothing() [io]
+    let e = dotenvparse.entry_quoted("TOKEN", "a b", DotenvSingleQuoted)
+    let d = dotenvwrite.append_blank(dotenvwrite.append_comment(
+        dotenvwrite.append(dotenvwrite.empty_document(), e), "secrets"))
+    test.assert_eq(dotenvwrite.render(d), "TOKEN='a b'\n# secrets\n\n")
+    test.assert_eq(dotenvwrite.render(dotenvwrite.empty_document()), "")
+    let exported = DotenvEntry { key: "A", value: "x\"y", quoting: DotenvDoubleQuoted,
+        exported: true, line: 0, written: "" }
+    test.assert_eq(dotenvwrite.render_entry(exported), "export A=\"x\\\"y\"")
+    test.assert_eq(dotenvwrite.render_pairs([("A", "1"), ("B", "two words")]), "A=1\nB='two words'\n")
+
+@test
+fn test_the_quoting_rules() [io]
+    test.assert_eq(dotenvwrite.escape("a\\b\"c\$d\ne\rf\tg"), "a\\\\b\\\"c\\\$d\\ne\\rf\\tg")
+    test.assert(dotenvwrite.can_single_quote("\$x"))
+    test.assert(not dotenvwrite.needs_quoting(""))
+    test.assert(dotenvwrite.needs_quoting("a`b"))
+    test.assert(dotenvwrite.quoting_for("a\rb") == DotenvDoubleQuoted)
+    test.assert(dotenvwrite.quoting_for("a\\b") == DotenvSingleQuoted)
+
+@test
+fn test_a_template_keeps_keys_and_notes() [io]
+    let d = doc("# the database\nexport DB_PASSWORD=\"s3cret\"\n\nPORT=5432\n")
+    let t = dotenvwrite.to_template(d)
+    test.assert_eq(dotenvwrite.render(t), "# the database\nexport DB_PASSWORD=\n\nPORT=\n")
+    test.case("the keys a real file lacks, or leaves empty")
+    let actual = [dotenvparse.entry("PORT", "1"), dotenvparse.entry("DB_PASSWORD", "")]
+    test.assert_eq(dotenvwrite.missing_against(t, actual), ["DB_PASSWORD"])
+    test.assert_eq(dotenvwrite.missing_against(doc("A=\nA=\n"), []), ["A"])
+
+@test
+fn test_a_skipped_line_is_written_back() [io]
+    let lax = DotenvOptions { interpolate: true, allow_export: true, allow_multiline: true,
+        strict: false, max_bytes: 100, max_expansions: 4 }
+    match dotenvparse.parse_document("junk\nA=1\n", lax)
+        Err(_) => test.fail("a parse that is not strict skips junk")
+        Ok(d)  => test.assert_eq(edited(dotenvwrite.set(d, "A", "2")), "junk\nA=2\n")
