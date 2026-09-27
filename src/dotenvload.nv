@@ -1,44 +1,32 @@
-// dotenvload.nv — the file on disk, and the policy that decides whether
-// it beats the environment.
+// dotenvload.nv — the file on disk, the process environment, and the
+// policy that decides which of the two wins.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// Two effect labels appear here, each for one thing.  `[fs]` reads and
+// writes the file.  `[io]` reads the process environment, because that
+// is what `std.env` declares: SPEC section 5.1 has no separate label for
+// the environment.  Only `environment`, `environment_value` and the two
+// `merged` functions carry `[io]`.
 //
-// TWO ROWS AND EACH ONE IS ONE THING.  `[fs]` is `std.fs.read`, for the
-// file.  `[io]` is `std.env.vars`, for the process environment — and
-// `[io]` is what `std.env` declares: THERE IS NO `[env]` LABEL in SPEC
-// § 5.1, because the label covers pipes, processes and the environment
-// together.  Two functions in this module read the environment and they
-// are the only ones that carry `[io]`.
+// This package never sets an environment variable.  Loading a file
+// means reading values: `load` answers the file's assignments and
+// `merged` answers the values a program should use.  A program that
+// takes its configuration as a value can be tested twice in one process.
 //
-// THIS PACKAGE DOES NOT PUT ANYTHING INTO THE ENVIRONMENT, and it could
-// not if it wanted to: `std.env` has no `set`.  Setting a variable is
-// `process.env_set`, which is a different module and a deliberate one.
-// So "loading a `.env` file" here means READING VALUES, not mutating
-// the process — `load` answers pairs, `merged` answers the pairs a
-// program should use, and what a caller does with them is the caller's.
-// That is also the better shape: a program that reads its configuration
-// from a value rather than from a global can be tested twice in one
-// process.
+// The override policy is an argument.  `DotenvKeepEnvironment` lets a
+// variable already in the environment win over the file, which is what
+// dotenvy and python-dotenv do by default and what makes
+// `DATABASE_URL=… ./myprogram` override one setting for one run.
+// `DotenvFileWins` is for a deployment tool that wrote the file.
 //
-// THE OVERRIDE POLICY IS AN ARGUMENT AND ITS DEFAULT IS THE ONE THAT
-// MAKES DEBUGGING POSSIBLE.  `DotenvKeepEnvironment` — a variable
-// already in the process environment wins over the file — is what
-// dotenvy and python-dotenv both default to, and the reason is
-// concrete: `DATABASE_URL=… ./myprogram` is how a person overrides a
-// setting for one run, and a loader that let the file win makes that
-// command do nothing at all, with no message.  `DotenvFileWins` is
-// there for the case where a deployment tool has written the file and
-// means it, and it is chosen by name.
-//
-// AND THE FILE IS FOUND BY WALKING UP, OR IT IS NOT FOUND AT ALL.
-// `find_upwards` looks in a directory and then its parents, which is
-// what every tool in this space does and what makes `.env` work from a
-// subdirectory of a project.  It is a SEPARATE function from `load`,
-// because a walk that surprised a caller by reading a file two
-// directories above the one they named is a walk that reads somebody
-// else's secrets.
+// `find_upwards` is a separate call from `load`.  A load reads the path
+// it is given and never a file in a parent directory.
 
+use std.list
+use std.fs
+use std.env
+use std.path
 use dotenvparse
+use dotenvwrite
 
 // The name every implementation of this format looks for.
 pub const DOTENV_FILE_NAME = ".env"
@@ -49,174 +37,270 @@ pub const DOTENV_TEMPLATE_NAME = ".env.example"
 // What wins when a key is in both the file and the process
 // environment.
 pub enum DotenvOverride
-    // The environment wins.  The default, because
-    // `FOO=bar ./myprogram` is how a person overrides one setting for
-    // one run, and a loader that let the file win makes that command
-    // silently do nothing.
+    // The environment wins, so `FOO=bar ./myprogram` overrides one
+    // setting for one run.
     DotenvKeepEnvironment
-    // The file wins.  For a deployment tool that wrote the file and
-    // means it; chosen by name, never by accident.
+    // The file wins, for a deployment tool that wrote the file.
     DotenvFileWins
 
 // What a load produced.
 pub struct DotenvLoaded
-    // Where it came from, for a report.
+    // The file it came from, or `""` when the entries were combined from
+    // values a caller held.
     path: Str
+    // The values to use.  From `load`, the file's assignments.  From
+    // `merged` and `combine`, the file's assignments with the policy
+    // applied, followed by the environment's variables that the file
+    // does not assign, with line 0.
     entries: [DotenvEntry]
-    // Keys the file assigned that the environment already had, under
-    // `DotenvKeepEnvironment`.  Not a fault: it is the information a
-    // person wants when a file's value did not take effect, and a
-    // loader that did not answer it makes that a mystery.
+    // The keys the file assigned that the environment already had, under
+    // `DotenvKeepEnvironment`.  A file's value for one of these did not
+    // take effect.
     shadowed: [Str]
 
-// What can go wrong loading a file.
+// What can go wrong loading or saving a file.
 pub enum DotenvLoadFault
-    // The file is not there.  Separate from every other variant because
-    // it is the one a caller routinely expects: a developer's machine
-    // has a `.env` and a production host does not.
+    // The file is not there, which is the ordinary state of a production
+    // host.
     DotenvFileAbsent(path: Str)
     // The file is there and could not be read.
     DotenvFileUnreadable(path: Str)
-    // The file parsed badly, carrying the grammar's own fault.
+    // The file could not be written.
+    DotenvFileUnwritable(path: Str)
+    // The file parsed badly, with the grammar's own fault.
     DotenvParseFault(path: Str, fault: DotenvFault)
-    // A file whose permissions let other users read it.  A `.env` holds
-    // credentials, and a world-readable one on a shared machine is
-    // worth a word — it is a fault a caller may ignore, not a refusal
-    // this package makes for them.
+    // A file whose permissions let other users read it.  No function in
+    // this package answers it; it is here for a caller that refuses such
+    // a file after asking `is_world_readable`.
     DotenvFileIsWorldReadable(path: Str)
-    // A walk that reached the filesystem root without finding one.
+    // A walk that reached the filesystem root without finding the file.
     DotenvNotFoundUpwards(started_at: Str)
 
-// Read a file and parse it.
+// A file read and parsed.
 //
-// `[fs]` and nothing else: the environment is not consulted here, so a
-// caller that only wants the file's own contents does not pay for a
-// read of the process environment.
+// `[fs]` and nothing else: the environment is not consulted, so a
+// reference in the file resolves against the file's earlier lines only.
+//
+// ```novo
+// use dotenvload
+// use dotenvparse
+//
+// fn main() [fs, io]
+//     match dotenvload.load("/nonexistent/.env", dotenvparse.default_options())
+//         Ok(l)  => println(l.path)
+//         Err(e) => println(e.message())
+// ```
 pub fn load(path: Str, options: DotenvOptions) -> Result<DotenvLoaded, DotenvLoadFault> [fs]
-    todo("dotenv-nv.dotenvload.load")
+    let d = load_document(path, options)!
+    Ok(DotenvLoaded { path: path, entries: dotenvparse.entries_of(d), shadowed: [] })
 
-// Read a file if it is there, and answer `None` if it is not.
-//
-// The shape a program wants: a missing `.env` on a production host is
-// the normal case, and a caller that had to match `DotenvFileAbsent`
-// out of a `Result` would write that match in every program.
+// A file read and parsed, or `None` when it is not there.
 pub fn load_optional(path: Str,
                      options: DotenvOptions) -> Result<?DotenvLoaded, DotenvLoadFault> [fs]
-    todo("dotenv-nv.dotenvload.load_optional")
+    match load(path, options)
+        Ok(l)                    => Ok(Some(l))
+        Err(DotenvFileAbsent(_)) => Ok(None)
+        Err(f)                   => Err(f)
 
-// Read a file as a document, keeping its comments — for a caller that
-// is about to write it back.
+// A file read as a document, keeping its comments, for a caller that
+// will write it back.
 pub fn load_document(path: Str,
                      options: DotenvOptions) -> Result<DotenvDocument, DotenvLoadFault> [fs]
-    todo("dotenv-nv.dotenvload.load_document")
+    let text = read_text(path)!
+    match dotenvparse.parse_document(text, options)
+        Ok(d)  => Ok(d)
+        Err(f) => Err(DotenvParseFault(path, f))
 
-// Write a document back to a file.
+// A document written to a file, answering `None` when it was written.
 //
-// Through a temporary file and a rename, so a process that dies
-// mid-write leaves the previous file rather than half of the new one.
-// A `.env` truncated by a power cut is every credential in it gone.
+// The text goes to `<path>.tmp` first and is renamed over the file, so
+// a process that dies mid-write leaves the previous file whole.  A file
+// that was already there keeps its permissions; a new one is created
+// readable by its owner alone.
 pub fn save_document(path: Str, d: DotenvDocument) -> ?DotenvLoadFault [fs]
-    todo("dotenv-nv.dotenvload.save_document")
+    let tmp = path + ".tmp"
+    let mode = fs.file_mode(path) ?? 384
+    if not fs.write(tmp, dotenvwrite.render(d))
+        return Some(DotenvFileUnwritable(path))
+    fs.set_file_mode(tmp, mode)
+    if not fs.rename(tmp, path)
+        fs.delete(tmp)
+        return Some(DotenvFileUnwritable(path))
+    None
 
-// Look for a `.env` in a directory and then in each parent.
+// The path of the first file called `name` in `start_dir` or one of its
+// parents, nearest first.
 //
-// Separate from `load` on purpose: a walk that surprised a caller by
-// reading a file two directories above the one they named is a walk
-// that reads somebody else's secrets.  A caller asks for it.
+// `start_dir` is made absolute against the working directory before the
+// walk.
 pub fn find_upwards(start_dir: Str, name: Str) -> Result<Str, DotenvLoadFault> [fs]
-    todo("dotenv-nv.dotenvload.find_upwards")
+    var dir = path.normalize(path.absolute(start_dir))
+    while true
+        let candidate = path.join(dir, name)
+        if fs.is_file(candidate)
+            return Ok(candidate)
+        let parent = path.dirname(dir)
+        if parent == dir or parent == ""
+            break
+        dir = parent
+    Err(DotenvNotFoundUpwards(start_dir))
 
-// Whether a file's permissions let other users read it.
+// Whether a file's permissions let users other than its owner and group
+// read it.  False for a file that is not there.
 //
-// A `.env` holds credentials.  This is a question a caller can ask, not
-// a refusal this package makes on their behalf — a container image
-// where everything runs as one user is a perfectly good place for a
-// mode-644 `.env`.
+// A `.env` holds credentials, so a caller may want to warn about such a
+// file.  This package reports it and refuses nothing.
 pub fn is_world_readable(path: Str) -> Bool [fs]
-    todo("dotenv-nv.dotenvload.is_world_readable")
+    (fs.file_mode(path) ?? 0) % 8 >= 4
 
-// The process environment, as pairs.
-//
-// `[io]`, which is what `std.env` declares — there is no `[env]` label
-// in SPEC § 5.1.  One of the two functions in this package that reads
-// it.
+// The process environment, as `(name, value)` pairs.
 pub fn environment() -> [(Str, Str)] [io]
-    todo("dotenv-nv.dotenvload.environment")
+    env.vars()
 
 // One variable from the process environment.
-//
-// The other of the two.  Everything else in this package takes what it
-// needs as an argument.
 pub fn environment_value(name: Str) -> ?Str [io]
-    todo("dotenv-nv.dotenvload.environment_value")
+    env.get(name)
 
-// The pairs a program should use: the file's and the environment's,
+// The values a program should use: a file's and the environment's,
 // combined under a policy.
 //
-// `[fs, io]` — the file and the environment, which is what combining
-// them costs.  The `shadowed` list in the answer says which of the
-// file's keys the environment already had, so "my `.env` change did
-// nothing" is a question with an answer.
+// A reference in the file resolves against the file's earlier lines and
+// then the environment.  A missing file is `DotenvFileAbsent`.
 pub fn merged(path: Str, policy: DotenvOverride,
               options: DotenvOptions) -> Result<DotenvLoaded, DotenvLoadFault> [fs, io]
-    todo("dotenv-nv.dotenvload.merged")
+    let text = read_text(path)!
+    let vars = environment()
+    match dotenvparse.parse_with(text, options, vars)
+        Ok(d)  => Ok(at_path(combine(dotenvparse.entries_of(d), vars, policy), path))
+        Err(f) => Err(DotenvParseFault(path, f))
 
-// The same, over a file that may not exist.
+// The same, treating a missing file as a file with no assignments.
+//
+// ```novo
+// use dotenvload
+// use dotenvparse
+//
+// fn main() [fs, io]
+//     match dotenvload.merged_optional(".env", DotenvKeepEnvironment, dotenvparse.default_options())
+//         Ok(l)  => println(dotenvload.value_of(l, "HOME") ?? "no HOME")
+//         Err(e) => println(e.message())
+// ```
 pub fn merged_optional(path: Str, policy: DotenvOverride,
                        options: DotenvOptions) -> Result<DotenvLoaded, DotenvLoadFault> [fs, io]
-    todo("dotenv-nv.dotenvload.merged_optional")
+    match merged(path, policy, options)
+        Err(DotenvFileAbsent(_)) => Ok(at_path(combine([], environment(), policy), path))
+        other                    => other
 
-// Combine a file's entries with an environment a caller already holds.
+// A file's entries combined with an environment the caller holds.
 //
-// `[]`: the policy is arithmetic, and separating it from the reads is
-// what lets a test assert every combination without a filesystem or a
-// process environment.
+// Under `DotenvKeepEnvironment` an entry whose key the environment has
+// takes the environment's value and its key is listed in `shadowed`.
+// Under `DotenvFileWins` the entries keep their values.  The
+// environment's other variables follow the entries, in its order.
 pub fn combine(entries: [DotenvEntry], env: [(Str, Str)], policy: DotenvOverride) -> DotenvLoaded []
-    todo("dotenv-nv.dotenvload.combine")
+    var out: [DotenvEntry] = []
+    var shadowed: [Str] = []
+    for e in entries
+        match env_lookup(env, e.key)
+            Some(v) =>
+                if keeps_environment(policy)
+                    list.push(out, with_value(e, v))
+                    if not list.contains(shadowed, e.key)
+                        list.push(shadowed, e.key)
+                else
+                    list.push(out, e)
+            None    => list.push(out, e)
+    for pr in env
+        if dotenvparse.lookup(entries, pr.0) == None
+            list.push(out, dotenvparse.entry(pr.0, pr.1))
+    DotenvLoaded { path: "", entries: out, shadowed: shadowed }
 
-// The pairs a `DotenvLoaded` came to, in order.
+// The `(key, value)` pairs of a load, in order.
 pub fn pairs_of_loaded(l: DotenvLoaded) -> [(Str, Str)] []
-    todo("dotenv-nv.dotenvload.pairs_of_loaded")
+    l.entries |> list.map(pair_of)
 
 // A value out of a load, or `None`.
 pub fn value_of(l: DotenvLoaded, key: Str) -> ?Str []
-    todo("dotenv-nv.dotenvload.value_of")
+    dotenvparse.lookup(l.entries, key)
 
-// The keys the environment shadowed, which is the answer to "why did my
-// file's value not take effect".
+// The keys whose file value the environment overrode.
 pub fn shadowed_keys(l: DotenvLoaded) -> [Str] []
-    todo("dotenv-nv.dotenvload.shadowed_keys")
+    l.shadowed[:]
 
-// A resolver for `dotenvparse.expand` over a file's own pairs and then
-// an environment the caller holds.
+// A resolver for `dotenvparse.expand`: a name's last value in `entries`,
+// else its value in `env`.
 //
-// The lookup ORDER, as a value: the file's earlier assignments first,
-// then the environment.  That is what every implementation of this
-// format does and it is worth being able to point at, because the other
-// order — environment first — makes a file unable to build a value out
-// of its own earlier lines, which is what `${BASE}/x` is for.
+// The file's own assignments come first, so a file can build
+// `${BASE}/x` out of a line above it.
 pub fn resolver_over(entries: [DotenvEntry], env: [(Str, Str)]) -> fn(Str) -> ?Str []
-    todo("dotenv-nv.dotenvload.resolver_over")
+    name => dotenvparse.lookup(entries, name) ?? env_lookup(env, name)
 
-// Every key a set of entries references but nothing resolves.
-//
-// The start-up check: a connection string with an empty
-// `${DB_PASSWORD}` in it connects to the wrong place rather than
-// failing, so a program that wants to refuse asks for this list first.
+// Every name the entries' values reference that neither the entries nor
+// `env` has a value for and that carries no default, each once, in
+// order.
 pub fn unresolved_in(entries: [DotenvEntry], env: [(Str, Str)]) -> [Str] []
-    todo("dotenv-nv.dotenvload.unresolved_in")
+    let resolve = resolver_over(entries, env)
+    var out: [Str] = []
+    for e in entries
+        for name in dotenvparse.unresolved_names(e.value, resolve)
+            if not list.contains(out, name)
+                list.push(out, name)
+    out
 
-// What went wrong loading a file, in one line.
+// What went wrong loading or saving a file, in one line.
 //
-// `DotenvFileAbsent` reads as a statement rather than a failure,
-// because on a production host it is one.
-//
-// ```novo ignore
+// ```novo
 // use dotenvload
 //
-// fn report(e: DotenvLoadFault) -> Str
-//     e.message()
+// fn main() [io]
+//     println(DotenvFileAbsent(".env").message())
 // ```
 impl Error for DotenvLoadFault
     fn message(self) -> Str
-        todo("dotenv-nv.dotenvload.DotenvLoadFault.message")
+        match self
+            DotenvFileAbsent(p)          => "${p}: there is no such file"
+            DotenvFileUnreadable(p)      => "${p}: the file could not be read"
+            DotenvFileUnwritable(p)      => "${p}: the file could not be written"
+            DotenvParseFault(p, f)       => "${p}: ${f.message()}"
+            DotenvFileIsWorldReadable(p) => "${p}: other users can read the file"
+            DotenvNotFoundUpwards(s)     => "no file found in ${s} or any directory above it"
+
+// A file's text, or the fault that explains why there is none.
+fn read_text(path: Str) -> Result<Str, DotenvLoadFault> [fs]
+    match fs.read(path)
+        Some(t) => Ok(t)
+        None    =>
+            if fs.exists(path)
+                return Err(DotenvFileUnreadable(path))
+            Err(DotenvFileAbsent(path))
+
+// The last value `env` holds for `name`.
+fn env_lookup(env: [(Str, Str)], name: Str) -> ?Str
+    var found: ?Str = None
+    for pr in env
+        if pr.0 == name
+            found = Some(pr.1)
+    found
+
+// An entry with another value, rendered from its fields from now on.
+fn with_value(e: DotenvEntry, v: Str) -> DotenvEntry
+    DotenvEntry { key: e.key,
+        value: v,
+        quoting: e.quoting,
+        exported: e.exported,
+        line: e.line,
+        written: "" }
+
+// An entry as its `(key, value)` pair.
+fn pair_of(e: DotenvEntry) -> (Str, Str)
+    (e.key, e.value)
+
+// A load with its path set.
+fn at_path(l: DotenvLoaded, p: Str) -> DotenvLoaded
+    DotenvLoaded { path: p, entries: l.entries, shadowed: l.shadowed }
+
+// Whether a policy gives a key to the environment.
+fn keeps_environment(policy: DotenvOverride) -> Bool
+    match policy
+        DotenvKeepEnvironment => true
+        DotenvFileWins        => false
