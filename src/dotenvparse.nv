@@ -1,76 +1,52 @@
-// dotenvparse.nv — the `.env` grammar: three value forms, three
-// different escape rules, and the comment that is sometimes part of the
-// value.
+// dotenvparse.nv — the `.env` grammar: the three value forms, their
+// escape rules, interpolation, and the comment that is sometimes part of
+// a value.
 //
-// Every body here is a `todo()`; the signatures are the design.
-// Every row is `[]`.
+// Nothing in this module reads a file or the environment, and every row
+// is `[]`.  A whole `.env` is a string the caller already holds.
 //
-// THIS MODULE IS `core`-SHAPED INSIDE A `host` PACKAGE.  Nothing here
-// reads a file or an environment; a whole `.env` is a string a test
-// writes out.
+// A value is written in one of three forms, and they do not agree.  A
+// single-quoted value is literal: `A='a\nb'` is four characters with a
+// backslash in them, and nothing is interpolated.  A double-quoted value
+// processes escapes and `${…}` references: `A="a\nb"` is three
+// characters with a newline in them.  A bare value is taken as written,
+// except that a `#` after whitespace starts a comment: `abc#123` is
+// seven characters and `abc #123` is three.
 //
-// THERE ARE THREE VALUE FORMS AND THEY DO NOT AGREE WITH EACH OTHER.
-// That is the entire difficulty of this format, and none of it is
-// visible when you look at a file:
+// Interpolation resolves each `${NAME}` through a function the caller
+// supplies, which keeps this module free of effects and makes the lookup
+// order the caller's.  A name with no value expands to nothing, which is
+// what a shell does, and `unresolved_names` answers which names those
+// were.
 //
-//   SINGLE QUOTES ARE LITERAL.  `PASSWORD='a\nb'` is six characters
-//   with a backslash in the middle, not a newline.  Nothing is
-//   interpolated and nothing is unescaped — not even `\'`, which
-//   cannot appear at all, so a single-quoted value cannot contain a
-//   single quote.
-//
-//   DOUBLE QUOTES INTERPOLATE AND UNESCAPE.  `PASSWORD="a\nb"` is five
-//   characters with a real newline, and `"${HOME}/x"` becomes a path.
-//
-//   UNQUOTED VALUES STRIP A TRAILING COMMENT, AND THAT IS THE TRAP.
-//   `PASSWORD=abc#123` is the seven characters `abc#123`, because the
-//   `#` does not follow whitespace.  `PASSWORD=abc #123` is the three
-//   characters `abc`.  One space, silently, and the password is wrong —
-//   and the program does not fail, it authenticates as nobody.
-//   `value_ends_at` is that rule as a named function so a test can
-//   assert both halves of it.
-//
-// INTERPOLATION RESOLVES THROUGH A FUNCTION THE CALLER SUPPLIES, which
-// is what keeps this module `[]` and what makes the ORDER visible.
-// `expand` takes a `fn(Str) -> ?Str`; `dotenvload` passes one that
-// looks at the pairs already parsed in this file and then at the real
-// environment, in that order, and a caller that wants the other order
-// or no environment at all passes a different function.  A module that
-// read the environment itself would have made that decision for
-// everybody and would not be `[]`.
-//
-// A `${VAR}` WITH NO VALUE IS EMPTY AND NOT AN ERROR, because that is
-// what every shell does and what every existing `.env` file assumes.
-// `${VAR:-default}` supplies one, and `${VAR}` alone with nothing
-// behind it expands to zero characters — which is also how a typo in a
-// variable name becomes a connection string with a hole in it.
-// `unresolved_names` is the function that answers what was empty, so a
-// caller that wants to refuse can.
-//
-// AND `export FOO=bar` IS AN ASSIGNMENT.  The prefix is there so the
-// file can be `source`d by a shell, it means nothing to a parser, and
-// a parser that treated `export` as part of the key produces a
-// variable called `export FOO`.
+// `export FOO=bar` assigns `FOO`.  The prefix lets a shell `source` the
+// file and means nothing else.
+
+use std.str
+use std.list
 
 // One assignment.
 pub struct DotenvEntry
     key: Str
-    // The value AFTER unescaping and interpolation for a double-quoted
-    // form, and exactly as written for a single-quoted one.
+    // The value after unescaping and interpolation for a double-quoted
+    // form, and exactly as written for the other two.
     value: Str
-    // Which of the three forms it was written in.  Kept because the
-    // writer has to put it back the way it found it, and because a
-    // caller reporting on a file wants to say which.
+    // Which of the three forms it was written in.
     quoting: DotenvQuoting
     // Whether the line carried the `export` prefix.
     exported: Bool
-    // 1-based, for a fault that has to say where.
+    // The 1-based line the assignment starts on, or 0 for an entry a
+    // program built.
     line: Int
+    // The assignment as it appears in the file, without its final line
+    // ending.  Empty for an entry a program built or changed, which the
+    // writer renders from the other fields instead.
+    written: Str
 
 // How a value was written.
 pub enum DotenvQuoting
-    // Bare.  A `#` after whitespace ends it; a `#` without whitespace
-    // in front does not.
+    // Bare.  A `#` after whitespace ends it; a `#` without whitespace in
+    // front of it does not.
     DotenvUnquoted
     // `'…'`.  Literal throughout: no escapes, no interpolation, and no
     // way to write a single quote inside one.
@@ -79,53 +55,54 @@ pub enum DotenvQuoting
     DotenvDoubleQuoted
 
 // One line of a file, as it was written.
-//
-// A file is a sequence of these and not a map, because the writer has
-// to put a file back with its comments, its blank lines and its order
-// intact — see `dotenvwrite`.
 pub enum DotenvLine
-    DotenvBlankLine
-    // A whole-line comment, with the `#` and the text after it.
+    // An empty line, or one holding only spaces and tabs, as written.
+    DotenvBlankLine(text: Str)
+    // A whole-line comment, as written, `#` included.
     DotenvCommentLine(text: Str)
     DotenvAssignmentLine(entry: DotenvEntry)
+    // A line a parse that is not strict could not read, as written, with
+    // the fault a strict parse would have answered.  It is rendered back
+    // unchanged and assigns nothing.
+    DotenvSkippedLine(text: Str, fault: DotenvFault)
 
-// A whole file, in order, with everything a person wrote still in it.
+// A whole file, in order, with every line a person wrote still in it.
 pub struct DotenvDocument
     lines: [DotenvLine]
+    // `"\n"`, or `"\r\n"` when the file's first line ended that way.
+    // Every line is rendered with it.
+    newline: Str
+    // Whether the last line ended with a line ending.
+    final_newline: Bool
 
 // What a parse is allowed to do.
-pub struct DotenvOptions
-    // Whether `${VAR}` in a double-quoted value is expanded.  On.  A
-    // caller reading a file it does not control may want it off, since
-    // interpolation can pull the process environment into a value.
+//
+// A value type: options are built whole, and a changed option is a new
+// literal.
+pub @value
+struct DotenvOptions
+    // Whether `${VAR}` in a double-quoted value is expanded.
     interpolate: Bool
-    // Whether the `export` prefix is accepted.  On.
+    // Whether the `export` prefix is accepted.
     allow_export: Bool
-    // Whether a quoted value may span lines.  On: a PEM key in a `.env`
-    // file is the case this exists for.
+    // Whether a quoted value may span lines.
     allow_multiline: Bool
     // Whether a line that is not an assignment, a comment or blank is a
-    // fault.  On.  Off makes a parser that skips junk, which is how a
-    // typo'd line becomes a variable nobody notices is missing.
+    // fault.  When false, such a line is kept as a `DotenvSkippedLine`.
     strict: Bool
-    // The largest file this parser will accept, in bytes.
+    // The largest file accepted, in bytes.
     max_bytes: Int
-    // The largest number of interpolation steps before a value is
-    // treated as circular.
+    // The deepest chain of references `expand` follows before it calls a
+    // value circular.
     max_expansions: Int
 
 // What a file can be wrong about.
-//
-// Every variant carries a line, because a `.env` file is a file a
-// person edits and a fault without a line number is one they cannot
-// act on.
 pub enum DotenvFault
     // A line that is not blank, not a comment and not an assignment.
     DotenvNotAnAssignment(line: Int, text: Str)
-    // A key with a character that is not allowed in an environment
-    // variable name.
+    // A key with a character an environment variable name may not hold.
     DotenvBadKey(line: Int, key: Str)
-    // An empty key — a line beginning `=`.
+    // An empty key: a line beginning `=`.
     DotenvEmptyKey(line: Int)
     // A quoted value whose closing quote never arrives.
     DotenvUnterminatedQuote(line: Int, quote: Str)
@@ -133,154 +110,524 @@ pub enum DotenvFault
     DotenvUnterminatedInterpolation(line: Int)
     // An escape sequence a double-quoted value does not define.
     DotenvBadEscape(line: Int, sequence: Str)
-    // Interpolation that did not settle: `A=${B}` and `B=${A}`.
+    // A chain of references deeper than `max_expansions`, such as
+    // `A=${B}` with `B=${A}` under `expand`.
     DotenvCircularInterpolation(name: Str, steps: Int)
-    // A file past the ceiling, carrying both numbers.
+    // A file past the size limit, with both numbers.
     DotenvTooLong(length: Int, most: Int)
-    // A multiline value in a parse that disallowed one.
+    // A quoted value spanning lines in a parse that disallows it.
     DotenvMultilineNotAllowed(line: Int)
-    // The same key assigned twice.  NOT a fault by default — the last
-    // one wins, which is what every other implementation does — but
-    // `duplicate_keys` answers them so a caller that wants to refuse
-    // can.
+    // The same key assigned twice.  A parse never answers it, since the
+    // last assignment wins; `duplicate_keys` does.
     DotenvDuplicateKey(line: Int, key: Str, first_line: Int)
 
-// The options every other implementation of this format behaves as.
+// The options python-dotenv and dotenvy behave as: interpolation,
+// `export` and multiline values on, strict, a one-mebibyte file limit,
+// and references followed 32 deep.
+//
+// ```novo
+// use dotenvparse
+//
+// fn main() [io]
+//     println("${dotenvparse.default_options().interpolate}")
+// ```
 pub fn default_options() -> DotenvOptions []
-    todo("dotenv-nv.dotenvparse.default_options")
+    DotenvOptions { interpolate: true,
+        allow_export: true,
+        allow_multiline: true,
+        strict: true,
+        max_bytes: 1048576,
+        max_expansions: 32 }
 
-// Options that expand nothing, for a file whose contents are not
-// trusted.
+// The default options with interpolation off, for a file whose contents
+// are not trusted.
 //
-// Interpolation can pull the process environment into a value, so a
-// program reading somebody else's `.env` should be able to say no to
-// that without giving up the rest of the grammar.
+// Interpolation can pull the process environment into a value.  Under
+// these options a double-quoted `${HOME}` stays those seven characters.
 pub fn literal_options() -> DotenvOptions []
-    todo("dotenv-nv.dotenvparse.literal_options")
+    DotenvOptions { interpolate: false,
+        allow_export: true,
+        allow_multiline: true,
+        strict: true,
+        max_bytes: 1048576,
+        max_expansions: 32 }
 
-// Parse a file into its pairs, in the order they appear.
+// The assignments in a file, in the order they appear.
 //
-// Ordered, and not a map: the order is what decides which of two
-// assignments to one key wins, and a map would have thrown that away
-// before the caller could ask.
+// A reference in a double-quoted value resolves against the file's
+// earlier assignments only.  `parse_with` also consults an environment.
+//
+// ```novo
+// use dotenvparse
+//
+// fn main() [io]
+//     match dotenvparse.parse("A=1\nexport B='two'\n", dotenvparse.default_options())
+//         Ok(es) => println(es[1].value)
+//         Err(e) => println(e.message())
+// ```
 pub fn parse(text: Str, options: DotenvOptions) -> Result<[DotenvEntry], DotenvFault> []
-    todo("dotenv-nv.dotenvparse.parse")
+    match parse_with(text, options, [])
+        Ok(d)  => Ok(entries_of(d))
+        Err(f) => Err(f)
 
-// Parse a file into a document, keeping every comment and blank line.
+// A file as a document, keeping every comment and blank line.
 //
-// The form the writer needs.  `parse` is this with the comments
-// dropped, and a caller that only wants values should use that one.
+// `dotenvwrite.render` of the answer is the text again, byte for byte.
+// A file that mixes `\n` and `\r\n` endings comes back with the first
+// line's ending on every line.
 pub fn parse_document(text: Str, options: DotenvOptions) -> Result<DotenvDocument, DotenvFault> []
-    todo("dotenv-nv.dotenvparse.parse_document")
+    parse_with(text, options, [])
+
+// A file as a document, with references resolved against the file's
+// earlier assignments first and then against `env`.
+//
+// `env` is a list of `(name, value)` pairs, as `std.env.vars` answers
+// them.  `dotenvload.merged` passes the process environment here.
+pub fn parse_with(text: Str, options: DotenvOptions,
+                  env: [(Str, Str)]) -> Result<DotenvDocument, DotenvFault> []
+    if str.len(text) > options.max_bytes
+        return Err(DotenvTooLong(str.len(text), options.max_bytes))
+    let src = str.replace_all(text, "\r\n", "\n")
+    var lines: [DotenvLine] = []
+    var earlier: [DotenvEntry] = []
+    var pos = 0
+    var line = 1
+    while at(src, pos) >= 0
+        let eol = line_end(src, pos)
+        let raw = str.slice(src, pos, eol)
+        let trimmed = str.trim(raw)
+        if trimmed == ""
+            list.push(lines, DotenvBlankLine(raw))
+            pos = eol + 1
+            line = line + 1
+        else if str.starts_with(trimmed, "#")
+            list.push(lines, DotenvCommentLine(raw))
+            pos = eol + 1
+            line = line + 1
+        else
+            match assignment(src, pos, line, options, earlier, env)
+                Ok(e)  =>
+                    list.push(lines, DotenvAssignmentLine(e))
+                    list.push(earlier, e)
+                    pos = pos + str.len(e.written) + 1
+                    line = line + str.count(e.written, "\n") + 1
+                Err(f) =>
+                    if options.strict
+                        return Err(f)
+                    list.push(lines, DotenvSkippedLine(raw, f))
+                    pos = eol + 1
+                    line = line + 1
+    Ok(DotenvDocument { lines: lines,
+        newline: newline_of(text),
+        final_newline: str.ends_with(src, "\n") })
 
 // The assignments in a document, in order.
 pub fn entries_of(d: DotenvDocument) -> [DotenvEntry] []
-    todo("dotenv-nv.dotenvparse.entries_of")
+    var out: [DotenvEntry] = []
+    for l in d.lines
+        if let DotenvAssignmentLine(e) = l
+            list.push(out, e)
+    out
 
 // The pairs in a document, in order, as plain strings.
-//
-// The shape config-nv's existing `parse_dotenv` answers, so an adapter
-// over this package is one call.
 pub fn pairs_of(d: DotenvDocument) -> [(Str, Str)] []
-    todo("dotenv-nv.dotenvparse.pairs_of")
+    entries_of(d) |> list.map(pair_of)
 
-// The last value assigned to a key, which is the one that wins.
+// The last value assigned to a key, which is the one that takes effect.
 pub fn lookup(entries: [DotenvEntry], key: Str) -> ?Str []
-    todo("dotenv-nv.dotenvparse.lookup")
+    var found: ?Str = None
+    for e in entries
+        if e.key == key
+            found = Some(e.value)
+    found
 
-// Every key assigned more than once, with both line numbers.
-//
-// Not a fault by default, because the last one winning is what every
-// other implementation does and what a file with a commented-out
-// override relies on.  A caller that wants to refuse asks.
+// One `DotenvDuplicateKey` for every assignment to a key that an
+// earlier line already assigned, with the first line it was assigned
+// on.
 pub fn duplicate_keys(entries: [DotenvEntry]) -> [DotenvFault] []
-    todo("dotenv-nv.dotenvparse.duplicate_keys")
+    var out: [DotenvFault] = []
+    for i in 0..list.len(entries)
+        let first = earlier_index(entries, i)
+        if first >= 0
+            list.push(out, DotenvDuplicateKey(entries[i].line, entries[i].key, entries[first].line))
+    out
 
-// Whether a key is a legal environment variable name: a letter or
-// underscore, then letters, digits and underscores.
+// Whether a key is a legal environment variable name: an ASCII letter
+// or underscore, then letters, digits and underscores.
 pub fn key_is_valid(key: Str) -> Bool []
-    todo("dotenv-nv.dotenvparse.key_is_valid")
+    let first = str.byte_at_or(key, 0, -1)
+    if not (is_letter(first) or first == '_')
+        return false
+    for i in 1..str.len(key)
+        let b = str.byte_at_or(key, i, -1)
+        if not (is_letter(b) or is_digit(b) or b == '_')
+            return false
+    true
 
-// Where an UNQUOTED value ends, given the text after the `=`.
+// Where a bare value ends, given the text after the `=` and any spaces
+// following it.
 //
-// The rule that makes `abc#123` seven characters and `abc #123` three:
-// a `#` ends the value only when whitespace precedes it.  Public and
-// named because it is the silent failure in this format and a test
-// should assert both halves of it directly.
+// A `#` ends the value when a space or tab precedes it, and trailing
+// spaces and tabs are not part of the value.  So `abc#123` answers 7
+// and `abc #123` answers 3.
+//
+// ```novo
+// use dotenvparse
+//
+// fn main() [io]
+//     println("${dotenvparse.value_ends_at("abc #123")}")
+// ```
 pub fn value_ends_at(text: Str) -> Int []
-    todo("dotenv-nv.dotenvparse.value_ends_at")
+    var end = str.len(text)
+    for i in 1..str.len(text)
+        if at(text, i) == '#' and is_blank(at(text, i - 1))
+            end = i
+            break
+    while end > 0 and is_blank(at(text, end - 1))
+        end = end - 1
+    end
 
-// Unescape a double-quoted value's body.
+// A double-quoted value's body with its escape sequences replaced.
 //
-// `\n`, `\r`, `\t`, `\\`, `\"`, `\$` — and nothing else, because an
-// undefined escape is `DotenvBadEscape` rather than a backslash that
-// silently survives into a password.
+// The sequences are `\n`, `\r`, `\t`, `\\`, `\"`, `\'` and `\$`.  Any
+// other backslash is `DotenvBadEscape`, so that a mistyped escape does
+// not survive into a password.  A `${…}` reference is left as written.
 pub fn unescape(body: Str, line: Int) -> Result<Str, DotenvFault> []
-    todo("dotenv-nv.dotenvparse.unescape")
+    let nothing = name => None
+    decode(body, nothing, line, false)
 
-// Expand `${…}` references in a value, resolving each through a
-// function the caller supplies.
+// A value with each `${NAME}` and `${NAME:-default}` replaced by what
+// `resolve` answers for the name.
 //
-// The resolver is the argument that keeps this module `[]` and makes
-// the lookup order the caller's: `dotenvload` passes one that reads the
-// file's own pairs first and then the process environment, and a caller
-// that wants neither passes one that always answers `None`.
+// A name `resolve` has no answer for expands to its default, or to
+// nothing.  An answer that itself holds a reference is expanded in
+// turn, to a depth of `options.max_expansions`; past that the value is
+// `DotenvCircularInterpolation`.  Escapes are not processed here.
 //
-// A name with no value expands to nothing rather than failing, because
-// that is what a shell does and what existing files assume.
-// `unresolved_names` is how a caller finds out it happened.
+// ```novo
+// use dotenvparse
+//
+// fn home(name: Str) -> ?Str
+//     if name == "HOME"
+//         return Some("/home/ops")
+//     None
+//
+// fn main() [io]
+//     match dotenvparse.expand("\${HOME}/bin", home, 1, dotenvparse.default_options())
+//         Ok(v)  => println(v)
+//         Err(e) => println(e.message())
+// ```
 pub fn expand(value: Str, resolve: fn(Str) -> ?Str, line: Int,
               options: DotenvOptions) -> Result<Str, DotenvFault> []
-    todo("dotenv-nv.dotenvparse.expand")
+    expand_at(value, resolve, line, options.max_expansions, 0)
 
 // The `${…}` names in a value, in order, whether or not they resolve.
 pub fn referenced_names(value: Str) -> [Str] []
-    todo("dotenv-nv.dotenvparse.referenced_names")
+    references_in(value) |> list.map(r => name_of_reference(r))
 
-// The names in a value that a resolver had nothing for, so a caller
-// that wants a missing variable to be an error can say so.
-//
-// The function that turns this format's most forgiving behaviour into
-// something a deployment can check: a connection string with an empty
-// `${DB_PASSWORD}` in it is a string that connects to the wrong place
-// rather than one that fails.
+// The names in a value that `resolve` has no answer for and that carry
+// no default, which are the references that expand to nothing.
 pub fn unresolved_names(value: Str, resolve: fn(Str) -> ?Str) -> [Str] []
-    todo("dotenv-nv.dotenvparse.unresolved_names")
+    var out: [Str] = []
+    for r in references_in(value)
+        let name = name_of_reference(r)
+        if resolve(name) == None and default_of_reference(r) == None
+            list.push(out, name)
+    out
 
-// The default inside `${NAME:-default}`, or `None` when the reference
-// has none.
+// The default inside a reference written `NAME:-default`, or `None`
+// when it has none.  The argument is the text between `${` and `}`.
+//
+// The default is used when the name has no value at all; a name whose
+// value is empty expands to nothing, as python-dotenv does.
 pub fn default_of_reference(reference: Str) -> ?Str []
-    todo("dotenv-nv.dotenvparse.default_of_reference")
+    match str.index(reference, ":-")
+        Some(i) => Some(str.slice(reference, i + 2, str.len(reference)))
+        None    => None
 
-// The variable name inside a `${…}` reference, with any default
-// stripped.
+// The variable name inside a reference, with any default removed.  The
+// argument is the text between `${` and `}`.
 pub fn name_of_reference(reference: Str) -> Str []
-    todo("dotenv-nv.dotenvparse.name_of_reference")
+    match str.index(reference, ":-")
+        Some(i) => str.slice(reference, 0, i)
+        None    => reference
 
-// The line a fault happened on, so a caller can report it without
-// matching every variant.
+// The line a fault is on, or 0 for the two faults that concern no one
+// line: `DotenvCircularInterpolation` and `DotenvTooLong`.
 pub fn fault_line(f: DotenvFault) -> Int []
-    todo("dotenv-nv.dotenvparse.fault_line")
+    match f
+        DotenvNotAnAssignment(l, _)        => l
+        DotenvBadKey(l, _)                 => l
+        DotenvEmptyKey(l)                  => l
+        DotenvUnterminatedQuote(l, _)      => l
+        DotenvUnterminatedInterpolation(l) => l
+        DotenvBadEscape(l, _)              => l
+        DotenvCircularInterpolation(_, _)  => 0
+        DotenvTooLong(_, _)                => 0
+        DotenvMultilineNotAllowed(l)       => l
+        DotenvDuplicateKey(l, _, _)        => l
 
-// An entry, for a caller building a file rather than reading one.
+// An entry for a program building a file, bare and without `export`.
 pub fn entry(key: Str, value: Str) -> DotenvEntry []
-    todo("dotenv-nv.dotenvparse.entry")
+    entry_quoted(key, value, DotenvUnquoted)
 
-// The same, written in a chosen form.
+// An entry written in a chosen form.
 pub fn entry_quoted(key: Str, value: Str, quoting: DotenvQuoting) -> DotenvEntry []
-    todo("dotenv-nv.dotenvparse.entry_quoted")
+    DotenvEntry { key: key, value: value, quoting: quoting, exported: false, line: 0, written: "" }
 
-// What was wrong with a `.env` file, in one line.
+// What was wrong with a `.env` file, in one line, with the line number
+// where there is one.
 //
-// Every line carries the line number, because this is a file a person
-// edits by hand.
-//
-// ```novo ignore
+// ```novo
 // use dotenvparse
 //
-// fn report(e: DotenvFault) -> Str
-//     e.message()
+// fn main() [io]
+//     println(DotenvEmptyKey(3).message())
 // ```
 impl Error for DotenvFault
     fn message(self) -> Str
-        todo("dotenv-nv.dotenvparse.DotenvFault.message")
+        match self
+            DotenvNotAnAssignment(l, t)        => "line ${l}: not an assignment: ${t}"
+            DotenvBadKey(l, k)                 => "line ${l}: '${k}' is not a legal variable name"
+            DotenvEmptyKey(l)                  => "line ${l}: the assignment has no name"
+            DotenvUnterminatedQuote(l, q)      => "line ${l}: the value's ${q} is never closed"
+            DotenvUnterminatedInterpolation(l) => "line ${l}: a reference has no closing brace"
+            DotenvBadEscape(l, s)              => "line ${l}: ${s} is not an escape sequence"
+            DotenvCircularInterpolation(n, s)  => "the reference to ${n} did not settle after ${s} steps"
+            DotenvTooLong(n, m)                => "the file is ${n} bytes, and the limit is ${m}"
+            DotenvMultilineNotAllowed(l)       => "line ${l}: a value spans lines, and this parse does not allow it"
+            DotenvDuplicateKey(l, k, f)        => "line ${l}: ${k} was already assigned on line ${f}"
+
+// An entry as its `(key, value)` pair.
+fn pair_of(e: DotenvEntry) -> (Str, Str)
+    (e.key, e.value)
+
+// `"\r\n"` when the text's first line ends that way, else `"\n"`.
+fn newline_of(text: Str) -> Str
+    if let Some(i) = str.index(text, "\n")
+        if i > 0 and at(text, i - 1) == '\r'
+            return "\r\n"
+    "\n"
+
+// One assignment starting at `pos`, which spans several lines when a
+// quoted value does.
+fn assignment(src: Str, pos: Int, line: Int, options: DotenvOptions, earlier: [DotenvEntry],
+              env: [(Str, Str)]) -> Result<DotenvEntry, DotenvFault>
+    let eol = line_end(src, pos)
+    var i = skip_blanks(src, pos)
+    var exported = false
+    if options.allow_export and has_export(src, i, eol)
+        exported = true
+        i = skip_blanks(src, i + 6)
+    let eq = str.index_from(src, "=", i) ?? eol
+    if eq >= eol
+        return Err(DotenvNotAnAssignment(line, str.trim(str.slice(src, pos, eol))))
+    let key = str.trim_end(str.slice(src, i, eq))
+    if key == ""
+        return Err(DotenvEmptyKey(line))
+    if not key_is_valid(key)
+        return Err(DotenvBadKey(line, key))
+    let v = skip_blanks(src, eq + 1)
+    let q = at(src, v)
+    if q == '\'' or q == '"'
+        let head = DotenvEntry { key: key, value: "", quoting: DotenvUnquoted,
+            exported: exported, line: line, written: "" }
+        return quoted(src, pos, v, head, options, earlier, env)
+    let rest = str.slice(src, v, eol)
+    let value = str.slice(rest, 0, value_ends_at(rest))
+    Ok(DotenvEntry { key: key, value: value, quoting: DotenvUnquoted,
+        exported: exported, line: line, written: str.slice(src, pos, eol) })
+
+// A single- or double-quoted value whose opening quote is at `v`.
+// `head` carries the key, the prefix and the line.
+fn quoted(src: Str, pos: Int, v: Int, head: DotenvEntry, options: DotenvOptions,
+          earlier: [DotenvEntry], env: [(Str, Str)]) -> Result<DotenvEntry, DotenvFault>
+    let q = at(src, v)
+    let close = closing_quote(src, v + 1, q)
+    if close < 0
+        return Err(DotenvUnterminatedQuote(head.line, str.from_byte(q)))
+    let body = str.slice(src, v + 1, close)
+    if not options.allow_multiline and str.contains(body, "\n")
+        return Err(DotenvMultilineNotAllowed(head.line))
+    let end = line_end(src, close)
+    let tail = str.trim(str.slice(src, close + 1, end))
+    if tail != "" and not str.starts_with(tail, "#")
+        let last = head.line + str.count(body, "\n")
+        return Err(DotenvNotAnAssignment(last, str.trim(str.slice(src, line_start(src, close), end))))
+    var value = body
+    var quoting = DotenvSingleQuoted
+    if q == '"'
+        quoting = DotenvDoubleQuoted
+        let resolve = name => resolve_in(earlier, env, name)
+        value = decode(body, resolve, head.line, options.interpolate)!
+    Ok(DotenvEntry { key: head.key, value: value, quoting: quoting,
+        exported: head.exported, line: head.line, written: str.slice(src, pos, end) })
+
+// The index of the quote that closes a value opened by `q`, scanning
+// from `from`, or -1.  Inside double quotes a backslash hides the byte
+// after it.
+fn closing_quote(src: Str, from: Int, q: Int) -> Int
+    var i = from
+    while at(src, i) >= 0
+        let b = at(src, i)
+        if b == q
+            return i
+        if b == '\\' and q == '"'
+            i = i + 1
+        i = i + 1
+    -1
+
+// Whether the text at `i` is the word `export` followed by a space or
+// tab, before the end of the line.
+fn has_export(src: Str, i: Int, eol: Int) -> Bool
+    i + 7 <= eol and str.slice(src, i, i + 6) == "export" and is_blank(at(src, i + 6))
+
+// The last value the file assigned to `name`, else the environment's.
+fn resolve_in(earlier: [DotenvEntry], env: [(Str, Str)], name: Str) -> ?Str
+    match lookup(earlier, name)
+        Some(v) => Some(v)
+        None    => env_value(env, name)
+
+// The index of the first entry before `i` that assigns the same key,
+// or -1.
+fn earlier_index(entries: [DotenvEntry], i: Int) -> Int
+    for j in 0..i
+        if entries[j].key == entries[i].key
+            return j
+    -1
+
+// The last value `env` holds for `name`.
+fn env_value(env: [(Str, Str)], name: Str) -> ?Str
+    var found: ?Str = None
+    for pr in env
+        if pr.0 == name
+            found = Some(pr.1)
+    found
+
+// A double-quoted body with its escapes replaced and, when
+// `interpolate` is set, its references resolved through `resolve`.  An
+// answer is inserted as written, as python-dotenv inserts it.
+fn decode(body: Str, resolve: fn(Str) -> ?Str, line: Int,
+          interpolate: Bool) -> Result<Str, DotenvFault>
+    var parts: [Str] = []
+    var run = 0
+    var i = 0
+    while at(body, i) >= 0
+        let b = at(body, i)
+        if b == '\\'
+            list.push(parts, str.slice(body, run, i))
+            list.push(parts, escaped(body, i, line)!)
+            i = i + 2
+            run = i
+        else if interpolate and b == '$' and at(body, i + 1) == '{'
+            let close = str.index_from(body, "}", i + 2) ?? -1
+            if close < 0
+                return Err(DotenvUnterminatedInterpolation(line))
+            let r = str.slice(body, i + 2, close)
+            list.push(parts, str.slice(body, run, i))
+            list.push(parts, resolve(name_of_reference(r)) ?? default_of_reference(r) ?? "")
+            i = close + 1
+            run = i
+        else
+            i = i + 1
+    list.push(parts, str.slice(body, run, str.len(body)))
+    Ok(str.join(parts, ""))
+
+// The text a backslash at `i` stands for.
+fn escaped(body: Str, i: Int, line: Int) -> Result<Str, DotenvFault>
+    let c = at(body, i + 1)
+    if c == 'n'
+        return Ok("\n")
+    if c == 'r'
+        return Ok("\r")
+    if c == 't'
+        return Ok("\t")
+    if c == '\\' or c == '"' or c == '\'' or c == '$'
+        return Ok(str.from_byte(c))
+    Err(DotenvBadEscape(line, str.slice(body, i, i + 2)))
+
+// `expand` at `depth` references deep.
+fn expand_at(value: Str, resolve: fn(Str) -> ?Str, line: Int, most: Int,
+             depth: Int) -> Result<Str, DotenvFault>
+    var parts: [Str] = []
+    var run = 0
+    var i = 0
+    while at(value, i) >= 0
+        if at(value, i) == '$' and at(value, i + 1) == '{'
+            let close = str.index_from(value, "}", i + 2) ?? -1
+            if close < 0
+                return Err(DotenvUnterminatedInterpolation(line))
+            let r = str.slice(value, i + 2, close)
+            list.push(parts, str.slice(value, run, i))
+            list.push(parts, expand_answer(r, resolve, line, most, depth)!)
+            i = close + 1
+            run = i
+        else
+            i = i + 1
+    list.push(parts, str.slice(value, run, str.len(value)))
+    Ok(str.join(parts, ""))
+
+// What one reference expands to under `expand`.
+fn expand_answer(r: Str, resolve: fn(Str) -> ?Str, line: Int, most: Int,
+                 depth: Int) -> Result<Str, DotenvFault>
+    let name = name_of_reference(r)
+    match resolve(name)
+        Some(v) =>
+            if not str.contains(v, "\${")
+                return Ok(v)
+            if depth >= most
+                return Err(DotenvCircularInterpolation(name, depth + 1))
+            expand_at(v, resolve, line, most, depth + 1)
+        None    => Ok(default_of_reference(r) ?? "")
+
+// The text inside each complete `${…}` in a value, in order.
+fn references_in(value: Str) -> [Str]
+    var out: [Str] = []
+    var from = 0
+    while from >= 0
+        from = next_reference(value, from, out)
+    out
+
+// Push the reference at or after `from` onto `out` and answer where the
+// search goes on, or -1 when there is none.
+fn next_reference(value: Str, from: Int, var out: [Str]) -> Int
+    let i = str.index_from(value, "\${", from) ?? -1
+    if i < 0
+        return -1
+    let close = str.index_from(value, "}", i + 2) ?? -1
+    if close < 0
+        return -1
+    list.push(out, str.slice(value, i + 2, close))
+    close + 1
+
+// The byte at `i`, or -1 past either end.
+fn at(s: Str, i: Int) -> Int
+    str.byte_at_or(s, i, -1)
+
+// The index of the `\n` ending the line that holds `pos`, or the
+// text's length.
+fn line_end(src: Str, pos: Int) -> Int
+    str.index_from(src, "\n", pos) ?? str.len(src)
+
+// The index just after the `\n` before `pos`, or 0.
+fn line_start(src: Str, pos: Int) -> Int
+    var i = pos
+    while i > 0 and at(src, i - 1) != '\n'
+        i = i - 1
+    i
+
+// The first index at or after `i` that is not a space or tab.
+fn skip_blanks(src: Str, i: Int) -> Int
+    var j = i
+    while is_blank(at(src, j))
+        j = j + 1
+    j
+
+fn is_blank(b: Int) -> Bool
+    b == ' ' or b == '\t'
+
+fn is_letter(b: Int) -> Bool
+    b >= 'a' and b <= 'z' or b >= 'A' and b <= 'Z'
+
+fn is_digit(b: Int) -> Bool
+    b >= '0' and b <= '9'
