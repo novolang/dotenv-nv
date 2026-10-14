@@ -1,0 +1,51 @@
+// hostile_tests.nv — references that double a value at every line.
+
+use std.test
+use std.list
+use std.str
+use dotenvparse
+
+@test
+fn test_a_value_that_doubles_at_every_line_is_refused() [io]
+    var text = "A0=xxxxxxxxxxxxxxxx\n"
+    for i in 1..40
+        text = text + "A${i}=\"\${A${i - 1}}\${A${i - 1}}\"\n"
+    match dotenvparse.parse(text, dotenvparse.default_options())
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+
+    test.case("a file that stays inside the limit still reads")
+    match dotenvparse.parse("A0=xx\nA1=\"\${A0}\${A0}\"\nA2=\"\${A1}\${A1}\"\n", dotenvparse.default_options())
+        Ok(entries) => test.assert(list.len(entries) == 3)
+        Err(_)      => test.assert(false)
+
+@test
+fn test_many_lines_naming_one_large_value_are_refused() [io]
+    let big = "x".repeat(900000)
+    var text = "BIG=" + big + "\n"
+    for i in 0..30
+        text = text + "A${i}=\"\${BIG}\"\n"
+    match dotenvparse.parse(text, dotenvparse.default_options())
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+
+// The value of `A<n>`: sixteen bytes for `A0`, and two references to
+// `A<n-1>` after it.
+fn doubling(name: Str) -> ?Str
+    let n = str.to_int(str.slice(name, 1, str.len(name))) ?? 0
+    if n == 0
+        Some("xxxxxxxxxxxxxxxx")
+    else
+        Some("\${A${n - 1}}\${A${n - 1}}")
+
+@test
+fn test_expand_refuses_a_reference_that_doubles_at_every_level() [io]
+    let limits = dotenvparse.default_options()
+    test.case("thirty levels of two references each")
+    match dotenvparse.expand("\${A30}", doubling, 1, limits)
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+    test.case("a shallow chain still expands")
+    match dotenvparse.expand("\${A3}", doubling, 1, limits)
+        Ok(v)  => test.assert(str.len(v) == 128)
+        Err(_) => test.assert(false)

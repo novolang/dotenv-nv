@@ -190,6 +190,10 @@ pub fn parse_with(text: Str, options: DotenvOptions,
     let src = str.replace_all(text, "\r\n", "\n")
     var lines: [DotenvLine] = []
     var earlier: [DotenvEntry] = []
+    // The values of all the assignments together are held to sixteen
+    // times the file limit, so that many lines each naming one large
+    // value cannot add up to more than a file could hold.
+    var held = 0
     var pos = 0
     var line = 1
     while at(src, pos) >= 0
@@ -207,6 +211,9 @@ pub fn parse_with(text: Str, options: DotenvOptions,
         else
             match assignment(src, pos, line, options, earlier, env)
                 Ok(e)  =>
+                    held = held + str.len(e.value)
+                    if held > options.max_bytes * 16
+                        return Err(DotenvTooLong(held, options.max_bytes * 16))
                     list.push(lines, DotenvAssignmentLine(e))
                     list.push(earlier, e)
                     pos = pos + str.len(e.written) + 1
@@ -294,7 +301,7 @@ pub fn value_ends_at(text: Str) -> Int []
 // not survive into a password.  A `${…}` reference is left as written.
 pub fn unescape(body: Str, line: Int) -> Result<Str, DotenvFault> []
     let nothing = name => None
-    decode(body, nothing, line, false)
+    decode(body, nothing, line, false, 0 - 1)
 
 // A value with each `${NAME}` and `${NAME:-default}` replaced by what
 // `resolve` answers for the name.
@@ -319,7 +326,7 @@ pub fn unescape(body: Str, line: Int) -> Result<Str, DotenvFault> []
 // ```
 pub fn expand(value: Str, resolve: fn(Str) -> ?Str, line: Int,
               options: DotenvOptions) -> Result<Str, DotenvFault> []
-    expand_at(value, resolve, line, options.max_expansions, 0)
+    expand_at(value, resolve, line, options.max_expansions, 0, options.max_bytes)
 
 // The `${…}` names in a value, in order, whether or not they resolve.
 pub fn referenced_names(value: Str) -> [Str] []
@@ -459,7 +466,7 @@ fn quoted(src: Str, pos: Int, v: Int, head: DotenvEntry, options: DotenvOptions,
     if q == '"'
         quoting = DotenvDoubleQuoted
         let resolve = name => resolve_in(earlier, env, name)
-        value = decode(body, resolve, head.line, options.interpolate)!
+        value = decode(body, resolve, head.line, options.interpolate, options.max_bytes)!
     Ok(DotenvEntry { key: head.key, value: value, quoting: quoting,
         exported: head.exported, line: head.line, written: str.slice(src, pos, end) })
 
@@ -507,8 +514,8 @@ fn env_value(env: [(Str, Str)], name: Str) -> ?Str
 // A double-quoted body with its escapes replaced and, when
 // `interpolate` is set, its references resolved through `resolve`.  An
 // answer is inserted as written, as python-dotenv inserts it.
-fn decode(body: Str, resolve: fn(Str) -> ?Str, line: Int,
-          interpolate: Bool) -> Result<Str, DotenvFault>
+fn decode(body: Str, resolve: fn(Str) -> ?Str, line: Int, interpolate: Bool,
+          most: Int) -> Result<Str, DotenvFault>
     var parts: [Str] = []
     var run = 0
     var i = 0
@@ -531,7 +538,12 @@ fn decode(body: Str, resolve: fn(Str) -> ?Str, line: Int,
         else
             i = i + 1
     list.push(parts, str.slice(body, run, str.len(body)))
-    Ok(str.join(parts, ""))
+    let joined = str.join(parts, "")
+    // A value that references one value twice doubles at each line, so
+    // the expanded text is held to `most` bytes, where -1 is no bound.
+    if most >= 0 and str.len(joined) > most
+        return Err(DotenvTooLong(str.len(joined), most))
+    Ok(joined)
 
 // The text a backslash at `i` stands for.
 fn escaped(body: Str, i: Int, line: Int) -> Result<Str, DotenvFault>
@@ -547,8 +559,8 @@ fn escaped(body: Str, i: Int, line: Int) -> Result<Str, DotenvFault>
     Err(DotenvBadEscape(line, str.slice(body, i, i + 2)))
 
 // `expand` at `depth` references deep.
-fn expand_at(value: Str, resolve: fn(Str) -> ?Str, line: Int, most: Int,
-             depth: Int) -> Result<Str, DotenvFault>
+fn expand_at(value: Str, resolve: fn(Str) -> ?Str, line: Int, most: Int, depth: Int,
+             bytes: Int) -> Result<Str, DotenvFault>
     var parts: [Str] = []
     var run = 0
     var i = 0
@@ -559,17 +571,20 @@ fn expand_at(value: Str, resolve: fn(Str) -> ?Str, line: Int, most: Int,
                 return Err(DotenvUnterminatedInterpolation(line))
             let r = str.slice(value, i + 2, close)
             list.push(parts, str.slice(value, run, i))
-            list.push(parts, expand_answer(r, resolve, line, most, depth)!)
+            list.push(parts, expand_answer(r, resolve, line, most, depth, bytes)!)
             i = close + 1
             run = i
         else
             i = i + 1
     list.push(parts, str.slice(value, run, str.len(value)))
-    Ok(str.join(parts, ""))
+    let joined = str.join(parts, "")
+    if str.len(joined) > bytes
+        return Err(DotenvTooLong(str.len(joined), bytes))
+    Ok(joined)
 
 // What one reference expands to under `expand`.
-fn expand_answer(r: Str, resolve: fn(Str) -> ?Str, line: Int, most: Int,
-                 depth: Int) -> Result<Str, DotenvFault>
+fn expand_answer(r: Str, resolve: fn(Str) -> ?Str, line: Int, most: Int, depth: Int,
+                 bytes: Int) -> Result<Str, DotenvFault>
     let name = name_of_reference(r)
     match resolve(name)
         Some(v) =>
@@ -577,7 +592,7 @@ fn expand_answer(r: Str, resolve: fn(Str) -> ?Str, line: Int, most: Int,
                 return Ok(v)
             if depth >= most
                 return Err(DotenvCircularInterpolation(name, depth + 1))
-            expand_at(v, resolve, line, most, depth + 1)
+            expand_at(v, resolve, line, most, depth + 1, bytes)
         None    => Ok(default_of_reference(r) ?? "")
 
 // The text inside each complete `${…}` in a value, in order.
